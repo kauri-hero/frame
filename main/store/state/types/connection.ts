@@ -7,7 +7,8 @@ const statusValues = [
   'standby',
   'off',
   'error',
-  'chain mismatch'
+  'chain mismatch',
+  'degraded'
 ] as const
 
 const presetValues = ['local', 'custom', 'pylon'] as const

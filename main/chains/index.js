@@ -391,9 +391,9 @@ class ChainConnection extends EventEmitter {
           log.info('Secondary connection connected')
           this.getNetwork(this.secondary.provider, (err, response) => {
             if (err) {
-              this.primary.connected = false
-              this.primary.type = ''
-              this.primary.status = 'error'
+              this.secondary.connected = false
+              this.secondary.type = ''
+              this.secondary.status = 'error'
               this.update('secondary')
 
               this._updateStatus('secondary', 'error')
