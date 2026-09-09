@@ -137,6 +137,8 @@ const mainState: M = {
   accountCloseLock: main('accountCloseLock', false),
   hardwareDerivation: main('hardwareDerivation', 'mainnet'),
   menubarGasPrice: main('menubarGasPrice', false),
+  pylonEnabled: main('pylonEnabled', true),
+  publicEndpointsEnabled: main('publicEndpointsEnabled', false),
   lattice: main('lattice', {}),
   latticeSettings: {
     accountLimit: main('latticeSettings.accountLimit', 5),

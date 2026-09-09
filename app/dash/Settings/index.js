@@ -59,7 +59,47 @@ class Settings extends Component {
     return (
       <div className={'localSettings cardShow'}>
         <div className='localSettingsWrap'>
+          <div className='signerPermission localSetting' style={{ zIndex: 215 }}>
+            <div className='signerPermissionControls'>
+              <div className='signerPermissionSetting'>Pylon RPC</div>
+              <div
+                className={
+                  this.store('main.pylonEnabled') !== false
+                    ? 'signerPermissionToggle signerPermissionToggleOn'
+                    : 'signerPermissionToggle'
+                }
+                onClick={() =>
+                  link.send('tray:action', 'setPylonEnabled', this.store('main.pylonEnabled') === false)
+                }
+              >
+                <div className='signerPermissionToggleSwitch' />
+              </div>
+            </div>
+            <div className='signerPermissionDetails'>
+              {'Use Pylon as the default RPC preset. Disable if Pylon endpoints are unreachable or causing connection issues.'}
+            </div>
+          </div>
           <div className='signerPermission localSetting' style={{ zIndex: 214 }}>
+            <div className='signerPermissionControls'>
+              <div className='signerPermissionSetting'>Public RPC</div>
+              <div
+                className={
+                  this.store('main.publicEndpointsEnabled')
+                    ? 'signerPermissionToggle signerPermissionToggleOn'
+                    : 'signerPermissionToggle'
+                }
+                onClick={() =>
+                  link.send('tray:action', 'setPublicEndpointsEnabled', !this.store('main.publicEndpointsEnabled'))
+                }
+              >
+                <div className='signerPermissionToggleSwitch' />
+              </div>
+            </div>
+            <div className='signerPermissionDetails'>
+              {'Make public RPC endpoints selectable as a connection type. Public endpoints are operated by third parties — they receive your IP address and all request data. Only enable if you understand and accept these privacy tradeoffs.'}
+            </div>
+          </div>
+          <div className='signerPermission localSetting' style={{ zIndex: 213 }}>
             <div className='signerPermissionControls'>
               <div className='signerPermissionSetting'>
                 <span style={{ position: 'relative' }}>

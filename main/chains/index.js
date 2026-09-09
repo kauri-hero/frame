@@ -79,13 +79,13 @@ class ChainConnection extends EventEmitter {
   }
 
   _createProvider(target, priority) {
-    log.debug('createProvider', { chainId: this.chainId, priority })
+    log.info(`createProvider chain=${this.chainId} ${priority}: ${target}`)
 
     this.update(priority)
 
     this[priority].provider = provider(target, {
       name: priority,
-      origin: 'frame'
+      origin: 'https://frame.sh'
     })
 
     this[priority].blockMonitor = this._createBlockMonitor(this[priority].provider, priority)
@@ -364,9 +364,13 @@ class ChainConnection extends EventEmitter {
 
     const currentPresets = { ...NETWORK_PRESETS.ethereum.default, ...NETWORK_PRESETS.ethereum[this.chainId] }
 
+    const pylonEnabled = store('main.pylonEnabled') !== false
+
     const { primary, secondary } = store('main.networks', this.type, this.chainId, 'connection')
-    const secondaryTarget =
-      secondary.current === 'custom' ? secondary.custom : currentPresets[secondary.current]
+    const secondaryTarget = (() => {
+      if (secondary.current === 'pylon' && !pylonEnabled) return null
+      return secondary.current === 'custom' ? secondary.custom : currentPresets[secondary.current]
+    })()
 
     if (chain.on && connection.secondary.on) {
       log.info('Secondary connection: ON')
@@ -413,7 +417,7 @@ class ChainConnection extends EventEmitter {
           })
         })
         this.secondary.provider.on('close', () => {
-          log.info('Secondary connection close')
+          log.warn(`Secondary connection closed chain=${this.chainId} target=${secondaryTarget}`)
           this.secondary.connected = false
           this.secondary.type = ''
           this.secondary.network = ''
@@ -430,7 +434,10 @@ class ChainConnection extends EventEmitter {
           }
         })
         this.secondary.provider.on('data', (data) => this.emit('data', data))
-        this.secondary.provider.on('error', (err) => this.emit('error', err))
+        this.secondary.provider.on('error', (err) => {
+          log.warn(`Secondary connection error chain=${this.chainId} target=${secondaryTarget}:`, err?.message || err)
+          this.emit('error', err)
+        })
       }
     } else {
       // Secondary connection is set to OFF by the user
@@ -439,7 +446,10 @@ class ChainConnection extends EventEmitter {
       this.resetConnection('secondary', 'off')
     }
 
-    const primaryTarget = primary.current === 'custom' ? primary.custom : currentPresets[primary.current]
+    const primaryTarget = (() => {
+      if (primary.current === 'pylon' && !pylonEnabled) return null
+      return primary.current === 'custom' ? primary.custom : currentPresets[primary.current]
+    })()
 
     if (chain.on && connection.primary.on) {
       log.info('Primary connection: ON')
@@ -456,15 +466,17 @@ class ChainConnection extends EventEmitter {
         this._createProvider(primaryTarget, 'primary')
 
         this.primary.provider.on('connect', () => {
-          log.info(`    Primary connection for network ${this.chainId} connected`)
+          log.info(`Primary connection socket open chain=${this.chainId} target=${primaryTarget} — verifying chainId`)
           this.getNetwork(this.primary.provider, (err, response) => {
             if (err) {
+              log.warn(`Primary getNetwork error chain=${this.chainId} target=${primaryTarget}:`, err?.message || err)
               this.primary.connected = false
               this.primary.type = ''
 
               this._updateStatus('primary', 'error')
             } else {
               this.primary.network = !err && response && !response.error ? response.result : ''
+              log.info(`Primary getNetwork response chain=${this.chainId} target=${primaryTarget} reported=${this.primary.network}`)
               if (this.primary.network && this.primary.network !== this.chainId) {
                 this.primary.connected = false
                 this.primary.type = ''
@@ -479,7 +491,7 @@ class ChainConnection extends EventEmitter {
           })
         })
         this.primary.provider.on('close', () => {
-          log.info('Primary connection close')
+          log.warn(`Primary connection closed chain=${this.chainId} target=${primaryTarget}`)
           this.primary.connected = false
           this.primary.type = ''
           this.primary.network = ''
@@ -498,7 +510,10 @@ class ChainConnection extends EventEmitter {
           }
         })
         this.primary.provider.on('data', (data) => this.emit('data', data))
-        this.primary.provider.on('error', (err) => this.emit('error', err))
+        this.primary.provider.on('error', (err) => {
+          log.warn(`Primary connection error chain=${this.chainId} target=${primaryTarget}:`, err?.message || err)
+          this.emit('error', err)
+        })
       }
     } else {
       log.info('Primary connection: OFF')

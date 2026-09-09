@@ -1,4 +1,4 @@
-import { app, ipcMain, protocol, clipboard, powerMonitor, BrowserWindow } from 'electron'
+import { app, ipcMain, protocol, clipboard, BrowserWindow } from 'electron'
 import path from 'path'
 import log from 'electron-log'
 import url from 'url'
@@ -6,6 +6,7 @@ import url from 'url'
 // DO NOT MOVE - env var below is required for app init and must be set before all local imports
 process.env.BUNDLE_LOCATION = process.env.BUNDLE_LOCATION || path.resolve(__dirname, './../..', 'bundle')
 
+import './identity'
 import * as errors from './errors'
 import windows from './windows'
 import menu from './menu'
@@ -76,22 +77,6 @@ process.on('uncaughtException', (e) => {
 process.on('unhandledRejection', (e) => {
   log.error('Unhandled Rejection!', e)
 })
-
-function startUpdater() {
-  powerMonitor.on('resume', () => {
-    log.debug('System resuming, starting updater')
-
-    updater.start()
-  })
-
-  powerMonitor.on('suspend', () => {
-    log.debug('System suspending, stopping updater')
-
-    updater.stop()
-  })
-
-  updater.start()
-}
 
 global.eval = () => {
   throw new Error(`This app does not support global.eval()`)
@@ -247,10 +232,6 @@ ipcMain.on('tray:syncPath', (e, path, value) => {
 
 ipcMain.on('tray:ready', () => {
   require('./api')
-
-  if (!isDev) {
-    startUpdater()
-  }
 })
 
 ipcMain.on('tray:updateRestart', () => {

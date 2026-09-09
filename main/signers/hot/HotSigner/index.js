@@ -1,3 +1,5 @@
+require('../../../identity')
+
 const path = require('path')
 const fs = require('fs')
 const { ensureDirSync, removeSync } = require('fs-extra')

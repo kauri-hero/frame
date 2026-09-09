@@ -11,7 +11,7 @@ const statusValues = [
   'degraded'
 ] as const
 
-const presetValues = ['local', 'custom', 'pylon'] as const
+const presetValues = ['local', 'custom', 'pylon', 'public'] as const
 
 export const ConnectionSchema = z.object({
   on: z.boolean(),

@@ -135,7 +135,11 @@ class ChainModule extends React.Component {
     const networkMeta = this.store('main.networksMeta.ethereum', id)
     const renderStatus = this.renderConnectionStatus.bind(this, type, id)
 
-    const networkPresets = NETWORK_PRESETS.ethereum[id] || {}
+    const publicEndpointsEnabled = this.store('main.publicEndpointsEnabled') === true
+    const allNetworkPresets = NETWORK_PRESETS.ethereum[id] || {}
+    const networkPresets = publicEndpointsEnabled
+      ? allNetworkPresets
+      : Object.fromEntries(Object.entries(allNetworkPresets).filter(([k]) => k !== 'public'))
     const defaultPresets = NETWORK_PRESETS.ethereum.default
 
     const presets = [
