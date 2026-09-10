@@ -1,17 +1,42 @@
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+
+import { fetchWithTimeout } from '../../../../resources/utils/fetch'
 import {
   applySymbolQuotes,
   collectQuoteSymbols,
+  createCmcPriceFeed,
+  EMPTY_TARGET_RETRY_MS,
   extractUsdQuote,
   fingerprintTargets,
+  FIRST_POLL_DELAY_MS,
   flattenCmcInfo,
   hasPositiveBalance,
   isCmcQuoteSymbol,
   matchCmcId,
+  MAX_EMPTY_TARGET_RETRIES,
   normalizeQuoteAssets,
   platformMatches,
   selectRateTargets,
   targetKey
 } from '../../../../main/externalData/assets/cmc'
+import {
+  CMC_CACHE_FILENAME,
+  cacheToRateUpdates,
+  getCmcCachePath,
+  loadCmcCache,
+  markDead,
+  nextSymbolBackoffMs,
+  planQuoteBatches,
+  saveCmcCache,
+  SYMBOL_BACKOFF_INITIAL_MS,
+  SYMBOL_BACKOFF_MAX_MS
+} from '../../../../main/externalData/assets/cmcCache'
+
+jest.mock('../../../../resources/utils/fetch', () => ({
+  fetchWithTimeout: jest.fn()
+}))
 
 const VVV = '0xacfe6019ed1a7dc6f7b508c02d1b04ec88cc21bf'
 
@@ -324,5 +349,540 @@ describe('subscription fingerprint', () => {
 
     expect(fingerprintTargets(a)).toBe(fingerprintTargets(b))
     expect(targetKey(b[0])).toBe(`t:8453:${VVV}`)
+  })
+})
+
+describe('CMC disk cache', () => {
+  let cacheDir
+
+  beforeEach(() => {
+    cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmc-rates-'))
+  })
+
+  afterEach(() => {
+    fs.rmSync(cacheDir, { recursive: true, force: true })
+  })
+
+  it('writes under the given userData path as cmc-rates.json', () => {
+    expect(getCmcCachePath(cacheDir)).toBe(path.join(cacheDir, CMC_CACHE_FILENAME))
+  })
+
+  it('hydrates only last-good positive quotes and never writes secrets or zero prices', () => {
+    const file = path.join(cacheDir, CMC_CACHE_FILENAME)
+    saveCmcCache(file, {
+      version: 1,
+      updatedAt: 1,
+      apiKey: 'should-not-be-saved',
+      CMC_API_KEY: 'also-secret',
+      rates: {
+        'n:1': { type: 'native', chainId: 1, symbol: 'ETH', usd: 2460, usd_24h_change: 1 },
+        'n:137': { type: 'native', chainId: 137, symbol: 'POL', usd: 0, usd_24h_change: 0 },
+        [`t:8453:${VVV}`]: {
+          type: 'token',
+          chainId: 8453,
+          address: VVV,
+          symbol: 'VVV',
+          usd: 22.4,
+          usd_24h_change: 3
+        }
+      },
+      dead: {
+        HOPELESS: {
+          symbol: 'HOPELESS',
+          reason: 'no-quote',
+          lastFailedAt: 10,
+          nextRetryAt: 20,
+          intervalMs: SYMBOL_BACKOFF_INITIAL_MS
+        }
+      }
+    })
+
+    const raw = fs.readFileSync(file, 'utf8')
+    expect(raw).not.toMatch(/should-not-be-saved|also-secret|CMC_API_KEY|apiKey/)
+
+    const loaded = loadCmcCache(file)
+    expect(loaded.rates['n:137']).toBeUndefined()
+    expect(loaded.rates['n:1'].usd).toBe(2460)
+    expect(loaded.dead.HOPELESS.reason).toBe('no-quote')
+
+    const updates = cacheToRateUpdates(loaded)
+    expect(updates.map((update) => [update.id.type, update.id.chainId, update.id.address, update.data.usd])).toEqual(
+      [
+        [0, 1, undefined, 2460],
+        [1, 8453, VVV, 22.4]
+      ]
+    )
+  })
+})
+
+describe('CMC symbol backoff', () => {
+  it('grows 2min → 4 → 8 and caps at 60min', () => {
+    expect(nextSymbolBackoffMs()).toBe(2 * 60_000)
+    expect(nextSymbolBackoffMs(SYMBOL_BACKOFF_INITIAL_MS)).toBe(4 * 60_000)
+    expect(nextSymbolBackoffMs(4 * 60_000)).toBe(8 * 60_000)
+    expect(nextSymbolBackoffMs(32 * 60_000)).toBe(SYMBOL_BACKOFF_MAX_MS)
+    expect(nextSymbolBackoffMs(SYMBOL_BACKOFF_MAX_MS)).toBe(SYMBOL_BACKOFF_MAX_MS)
+  })
+
+  it('records nextRetryAt and keeps not-due symbols out of the hot batch', () => {
+    const now = 1_700_000_000_000
+    const dead = {}
+    markDead(dead, 'vvv', 'no-quote', now)
+
+    expect(dead.VVV.intervalMs).toBe(SYMBOL_BACKOFF_INITIAL_MS)
+    expect(dead.VVV.nextRetryAt).toBe(now + SYMBOL_BACKOFF_INITIAL_MS)
+
+    const heldOut = planQuoteBatches({
+      nativeSymbols: ['ETH'],
+      tokenSymbols: ['VVV', 'USDC'],
+      dead,
+      now
+    })
+    expect(heldOut.hotTokenSymbols).toEqual(['USDC'])
+    expect(heldOut.retryTokenSymbols).toEqual([])
+    expect(heldOut.nativeSymbols).toEqual(['ETH'])
+
+    const due = planQuoteBatches({
+      nativeSymbols: ['ETH'],
+      tokenSymbols: ['VVV', 'USDC'],
+      dead,
+      now: now + SYMBOL_BACKOFF_INITIAL_MS
+    })
+    expect(due.hotTokenSymbols).toEqual(['USDC'])
+    expect(due.retryTokenSymbols).toEqual(['VVV'])
+  })
+})
+
+describe('CMC price feed cache and concurrency', () => {
+  const ACCOUNT = '0x1111111111111111111111111111111111111111'
+  const previousKey = process.env.CMC_API_KEY
+  let cacheDir
+  let cachePath
+  let feed
+
+  function createStore() {
+    const state = {
+      main: {
+        tokens: {
+          custom: [{ chainId: 8453, address: VVV, symbol: 'VVV' }],
+          known: {}
+        },
+        balances: {},
+        networks: {
+          ethereum: {
+            1: { isTestnet: false },
+            8453: { isTestnet: false }
+          }
+        }
+      }
+    }
+
+    return (...parts) =>
+      parts.flatMap((part) => String(part).split('.')).reduce((acc, key) => acc?.[key], state)
+  }
+
+  function quoteBody(rows) {
+    const data = {}
+    for (const row of rows) {
+      data[row.symbol] = {
+        id: row.id,
+        symbol: row.symbol,
+        quote: { USD: { price: row.usd, percent_change_24h: row.change || 0 } },
+        ...(row.address ? { platform: { slug: row.platform || 'base', token_address: row.address } } : {})
+      }
+    }
+    return { data, status: { error_code: 0, credit_count: 1 } }
+  }
+
+  async function waitUntil(predicate) {
+    for (let i = 0; i < 30; i++) {
+      if (predicate()) return
+      await Promise.resolve()
+    }
+    throw new Error('timed out waiting for CMC feed')
+  }
+
+  function pendingFetch() {
+    const started = []
+    fetchWithTimeout.mockImplementation((url) => {
+      const href = String(url)
+      const symbols = new URL(href, 'https://pro-api.coinmarketcap.com').searchParams.get('symbol') || ''
+      if (!href.includes('/v3/cryptocurrency/quotes/latest') || !symbols) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ data: {}, status: { error_code: 0, credit_count: 0 } })
+        })
+      }
+
+      return new Promise((resolve) => {
+        started.push({
+          url: href,
+          symbols,
+          resolve: (body, status = 200) =>
+            resolve({
+              ok: status >= 200 && status < 300,
+              status,
+              json: async () => body
+            })
+        })
+      })
+    })
+    return started
+  }
+
+  beforeEach(() => {
+    process.env.CMC_API_KEY = 'test-cmc-key'
+    cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmc-feed-'))
+    cachePath = path.join(cacheDir, CMC_CACHE_FILENAME)
+    jest.setSystemTime(1_700_000_000_000)
+  })
+
+  afterEach(() => {
+    feed?.stop()
+    feed = undefined
+    if (previousKey === undefined) delete process.env.CMC_API_KEY
+    else process.env.CMC_API_KEY = previousKey
+    fs.rmSync(cacheDir, { recursive: true, force: true })
+  })
+
+  it('hydrates main.rates-bound updates from disk before the first network poll', async () => {
+    saveCmcCache(cachePath, {
+      version: 1,
+      updatedAt: 1,
+      rates: {
+        'n:1': { type: 'native', chainId: 1, symbol: 'ETH', usd: 2460, usd_24h_change: 1 },
+        [`t:8453:${VVV}`]: {
+          type: 'token',
+          chainId: 8453,
+          address: VVV,
+          symbol: 'VVV',
+          usd: 22.4,
+          usd_24h_change: 3
+        }
+      },
+      dead: {}
+    })
+
+    const onUpdates = jest.fn()
+    const started = pendingFetch()
+    feed = createCmcPriceFeed(createStore(), onUpdates, undefined, { cachePath })
+    feed.start()
+
+    expect(onUpdates).toHaveBeenCalledTimes(1)
+    const hydrated = onUpdates.mock.calls[0][0]
+    expect(hydrated).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: { type: 0, chainId: 1 }, data: { usd: 2460, usd_24h_change: 1 } }),
+        expect.objectContaining({
+          id: { type: 1, chainId: 8453, address: VVV },
+          data: { usd: 22.4, usd_24h_change: 3 }
+        })
+      ])
+    )
+    expect(started).toHaveLength(0)
+    expect(fetchWithTimeout).not.toHaveBeenCalled()
+  })
+
+  it('fires native and custom symbol batches in the same tick', async () => {
+    const onUpdates = jest.fn()
+    const started = pendingFetch()
+    feed = createCmcPriceFeed(createStore(), onUpdates, undefined, { cachePath })
+    feed.updateSubscription([1, 8453], ACCOUNT)
+    feed.start()
+
+    await jest.advanceTimersByTimeAsync(1000)
+
+    const quoteCalls = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+    expect(quoteCalls).toHaveLength(2)
+    const symbolSets = quoteCalls.map((call) => call.symbols.split(',').filter(Boolean).sort())
+    expect(symbolSets).toEqual(expect.arrayContaining([['ETH'], ['VVV']]))
+
+    for (const call of quoteCalls) {
+      if (call.symbols.includes('ETH')) {
+        call.resolve(quoteBody([{ symbol: 'ETH', id: 1027, usd: 2460, change: 1 }]))
+      } else {
+        call.resolve(quoteBody([{ symbol: 'VVV', id: 31848, usd: 22.4, change: 3, address: VVV }]))
+      }
+    }
+
+    await waitUntil(() => {
+      const live = onUpdates.mock.calls.flatMap((call) => call[0])
+      const cached = loadCmcCache(cachePath)
+      return (
+        live.some((update) => update.id.type === 0 && update.data.usd === 2460) &&
+        live.some((update) => update.id.address === VVV && update.data.usd === 22.4) &&
+        cached.rates['n:1']?.usd === 2460 &&
+        cached.rates[`t:8453:${VVV}`]?.usd === 22.4
+      )
+    })
+
+    const cached = loadCmcCache(cachePath)
+    expect(cached.rates['n:1'].usd).toBe(2460)
+    expect(cached.rates[`t:8453:${VVV}`].usd).toBe(22.4)
+    expect(JSON.stringify(cached)).not.toMatch(/test-cmc-key/)
+  })
+
+  it('keeps not-due failed symbols out of the hot batch and retries them separately when due', async () => {
+    const now = Date.now()
+    saveCmcCache(cachePath, {
+      version: 1,
+      updatedAt: now,
+      rates: {},
+      dead: {
+        VVV: {
+          symbol: 'VVV',
+          reason: 'http-500',
+          lastFailedAt: now - 1000,
+          nextRetryAt: now + 10 * 60_000,
+          intervalMs: SYMBOL_BACKOFF_INITIAL_MS
+        }
+      }
+    })
+
+    const started = pendingFetch()
+    feed = createCmcPriceFeed(createStore(), jest.fn(), undefined, { cachePath })
+    feed.updateSubscription([1, 8453], ACCOUNT)
+    feed.start()
+    await jest.advanceTimersByTimeAsync(1000)
+
+    const quoteCalls = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+    expect(quoteCalls).toHaveLength(1)
+    expect(quoteCalls[0].symbols).toBe('ETH')
+    expect(quoteCalls[0].symbols).not.toContain('VVV')
+
+    quoteCalls[0].resolve(quoteBody([{ symbol: 'ETH', id: 1027, usd: 2460 }]))
+    await waitUntil(() => loadCmcCache(cachePath).rates['n:1']?.usd === 2460)
+
+    expect(loadCmcCache(cachePath).dead.VVV.reason).toBe('http-500')
+
+    feed.stop()
+    jest.setSystemTime(now + 10 * 60_000)
+
+    const retryStarted = pendingFetch()
+    feed = createCmcPriceFeed(createStore(), jest.fn(), undefined, { cachePath })
+    feed.updateSubscription([1, 8453], ACCOUNT)
+    feed.start()
+    await jest.advanceTimersByTimeAsync(1000)
+
+    const retryCalls = retryStarted.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+    const retrySymbols = retryCalls.map((call) => call.symbols)
+    expect(retrySymbols.some((symbols) => symbols.split(',').includes('VVV'))).toBe(true)
+    expect(retrySymbols.some((symbols) => symbols === 'ETH' || symbols.split(',').includes('ETH'))).toBe(true)
+
+    for (const call of retryCalls) {
+      if (call.symbols.includes('VVV')) {
+        call.resolve(quoteBody([{ symbol: 'VVV', id: 31848, usd: 22.4, address: VVV }]))
+      } else {
+        call.resolve(quoteBody([{ symbol: 'ETH', id: 1027, usd: 2460 }]))
+      }
+    }
+    await waitUntil(
+      () => !loadCmcCache(cachePath).dead.VVV && loadCmcCache(cachePath).rates[`t:8453:${VVV}`]?.usd === 22.4
+    )
+
+    expect(loadCmcCache(cachePath).dead.VVV).toBeUndefined()
+    expect(loadCmcCache(cachePath).rates[`t:8453:${VVV}`].usd).toBe(22.4)
+  })
+
+  it('does not wait the full poll interval after an empty first poll', async () => {
+    const started = pendingFetch()
+    feed = createCmcPriceFeed(createStore(), jest.fn(), undefined, { cachePath })
+    feed.start()
+
+    await jest.advanceTimersByTimeAsync(FIRST_POLL_DELAY_MS)
+    expect(fetchWithTimeout).not.toHaveBeenCalled()
+
+    await jest.advanceTimersByTimeAsync(EMPTY_TARGET_RETRY_MS)
+    expect(fetchWithTimeout).not.toHaveBeenCalled()
+
+    feed.updateSubscription([1, 8453], ACCOUNT)
+    await jest.advanceTimersByTimeAsync(FIRST_POLL_DELAY_MS)
+
+    const quoteCalls = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+    expect(quoteCalls).toHaveLength(2)
+    const symbolSets = quoteCalls.map((call) => call.symbols.split(',').filter(Boolean).sort())
+    expect(symbolSets).toEqual(expect.arrayContaining([['ETH'], ['VVV']]))
+  })
+
+  it('catches up within seconds when more chains appear during a partial first poll', async () => {
+    const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+    const state = {
+      main: {
+        tokens: {
+          custom: [
+            { chainId: 1, address: USDC, symbol: 'USDC' },
+            { chainId: 8453, address: VVV, symbol: 'VVV' }
+          ],
+          known: {}
+        },
+        balances: {},
+        networks: {
+          ethereum: {
+            1: { isTestnet: false },
+            8453: { isTestnet: false }
+          }
+        }
+      }
+    }
+    const store = (...parts) =>
+      parts.flatMap((part) => String(part).split('.')).reduce((acc, key) => acc?.[key], state)
+
+    const started = pendingFetch()
+    feed = createCmcPriceFeed(store, jest.fn(), undefined, { cachePath })
+    feed.updateSubscription([1], ACCOUNT)
+    feed.start()
+    await jest.advanceTimersByTimeAsync(FIRST_POLL_DELAY_MS)
+
+    const firstCalls = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+    expect(firstCalls.length).toBeGreaterThan(0)
+    expect(firstCalls.every((call) => !call.symbols.split(',').includes('VVV'))).toBe(true)
+    expect(firstCalls.some((call) => call.symbols.split(',').includes('ETH'))).toBe(true)
+
+    feed.updateSubscription([1, 8453], ACCOUNT)
+
+    for (const call of firstCalls) {
+      if (call.symbols.includes('ETH')) {
+        call.resolve(quoteBody([{ symbol: 'ETH', id: 1027, usd: 2460 }]))
+      } else {
+        call.resolve(quoteBody([{ symbol: 'USDC', id: 3408, usd: 1, address: USDC }]))
+      }
+    }
+    await waitUntil(() => loadCmcCache(cachePath).rates['n:1']?.usd === 2460)
+    expect(loadCmcCache(cachePath).rates[`t:8453:${VVV}`]).toBeUndefined()
+
+    await jest.advanceTimersByTimeAsync(EMPTY_TARGET_RETRY_MS)
+
+    const catchUpCalls = started
+      .filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+      .slice(firstCalls.length)
+    expect(catchUpCalls.some((call) => call.symbols.split(',').includes('VVV'))).toBe(true)
+
+    for (const call of catchUpCalls) {
+      if (call.symbols.includes('VVV')) {
+        call.resolve(quoteBody([{ symbol: 'VVV', id: 31848, usd: 22.4, address: VVV }]))
+      } else if (call.symbols.includes('ETH')) {
+        call.resolve(quoteBody([{ symbol: 'ETH', id: 1027, usd: 2460 }]))
+      } else {
+        call.resolve(quoteBody([{ symbol: 'USDC', id: 3408, usd: 1, address: USDC }]))
+      }
+    }
+    await waitUntil(() => loadCmcCache(cachePath).rates[`t:8453:${VVV}`]?.usd === 22.4)
+    expect(loadCmcCache(cachePath).rates[`t:8453:${VVV}`].usd).toBe(22.4)
+  })
+
+  it('polls within seconds when chains appear after empty-target retries fall back', async () => {
+    const started = pendingFetch()
+    feed = createCmcPriceFeed(createStore(), jest.fn(), undefined, { cachePath })
+    feed.start()
+
+    await jest.advanceTimersByTimeAsync(FIRST_POLL_DELAY_MS)
+    for (let i = 0; i < MAX_EMPTY_TARGET_RETRIES; i++) {
+      await jest.advanceTimersByTimeAsync(EMPTY_TARGET_RETRY_MS)
+    }
+
+    await jest.advanceTimersByTimeAsync(EMPTY_TARGET_RETRY_MS)
+    expect(fetchWithTimeout).not.toHaveBeenCalled()
+
+    feed.updateSubscription([1, 8453], ACCOUNT)
+    await jest.advanceTimersByTimeAsync(FIRST_POLL_DELAY_MS)
+
+    const quoteCalls = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+    expect(quoteCalls.length).toBeGreaterThan(0)
+    expect(quoteCalls.some((call) => call.symbols.split(',').includes('VVV'))).toBe(true)
+  })
+
+  it('writes cmc-rates.json as soon as the first quotes land', async () => {
+    const leftover = '0x3333333333333333333333333333333333333333'
+    const state = {
+      main: {
+        tokens: {
+          custom: [
+            { chainId: 8453, address: VVV, symbol: 'VVV' },
+            { chainId: 8453, address: leftover }
+          ],
+          known: {}
+        },
+        balances: {},
+        networks: {
+          ethereum: {
+            1: { isTestnet: false },
+            8453: { isTestnet: false }
+          }
+        }
+      }
+    }
+    const store = (...parts) =>
+      parts.flatMap((part) => String(part).split('.')).reduce((acc, key) => acc?.[key], state)
+
+    const started = []
+    let resolveInfo
+    fetchWithTimeout.mockImplementation((url) => {
+      const href = String(url)
+      if (href.includes('/v2/cryptocurrency/info')) {
+        return new Promise((resolve) => {
+          resolveInfo = () =>
+            resolve({
+              ok: true,
+              status: 200,
+              json: async () => ({ data: {}, status: { error_code: 0, credit_count: 0 } })
+            })
+        })
+      }
+
+      const symbols = new URL(href, 'https://pro-api.coinmarketcap.com').searchParams.get('symbol') || ''
+      if (!href.includes('/v3/cryptocurrency/quotes/latest') || !symbols) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ data: {}, status: { error_code: 0, credit_count: 0 } })
+        })
+      }
+
+      return new Promise((resolve) => {
+        started.push({
+          url: href,
+          symbols,
+          resolve: (body, status = 200) =>
+            resolve({
+              ok: status >= 200 && status < 300,
+              status,
+              json: async () => body
+            })
+        })
+      })
+    })
+
+    const onUpdates = jest.fn()
+    feed = createCmcPriceFeed(store, onUpdates, undefined, { cachePath })
+    feed.updateSubscription([1, 8453], ACCOUNT)
+    feed.start()
+    await jest.advanceTimersByTimeAsync(FIRST_POLL_DELAY_MS)
+
+    const quoteCalls = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+    expect(quoteCalls).toHaveLength(2)
+    for (const call of quoteCalls) {
+      if (call.symbols.includes('ETH')) {
+        call.resolve(quoteBody([{ symbol: 'ETH', id: 1027, usd: 2460, change: 1 }]))
+      } else {
+        call.resolve(quoteBody([{ symbol: 'VVV', id: 31848, usd: 22.4, change: 3, address: VVV }]))
+      }
+    }
+
+    await waitUntil(() => {
+      const cached = loadCmcCache(cachePath)
+      const live = onUpdates.mock.calls.flatMap((call) => call[0])
+      return (
+        cached.rates['n:1']?.usd === 2460 &&
+        cached.rates[`t:8453:${VVV}`]?.usd === 22.4 &&
+        live.some((update) => update.id.address === VVV && update.data.usd === 22.4)
+      )
+    })
+
+    expect(loadCmcCache(cachePath).rates[`t:8453:${VVV}`].usd).toBe(22.4)
+    expect(JSON.stringify(loadCmcCache(cachePath))).not.toMatch(/test-cmc-key/)
+
+    await waitUntil(() => typeof resolveInfo === 'function')
+    resolveInfo()
   })
 })

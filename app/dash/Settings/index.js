@@ -28,6 +28,26 @@ const EditShortcut = styled.div`
   }
 `
 
+const DocsLink = styled.div`
+  background: var(--ghostC);
+  height: 20px;
+  min-width: 60px;
+  padding: 0 10px;
+  margin-right: 6px;
+  margin-left: 12px;
+  margin-top: 4px;
+  border-radius: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 500;
+`
+
+const CMC_QUOTES_LATEST_DOCS = 'https://coinmarketcap.com/api/documentation/guides/get-latest-crypto-prices'
+
 class Settings extends Component {
   constructor(props, context) {
     super(props, context)
@@ -97,6 +117,19 @@ class Settings extends Component {
             </div>
             <div className='signerPermissionDetails'>
               {'Make public RPC endpoints selectable as a connection type. Public endpoints are operated by third parties — they receive your IP address and all request data. Only enable if you understand and accept these privacy tradeoffs.'}
+            </div>
+          </div>
+          <div className='signerPermission localSetting' style={{ zIndex: 213 }}>
+            <div className='signerPermissionControls'>
+              <div className='signerPermissionSetting'>CMC Price API</div>
+              <DocsLink
+                onClick={() => link.send('tray:openExternal', CMC_QUOTES_LATEST_DOCS)}
+              >
+                Docs
+              </DocsLink>
+            </div>
+            <div className='signerPermissionDetails'>
+              {'Bring your own CoinMarketCap API key (set CMC_API_KEY in .env.local) so Frame Fork can fetch token and native USD prices.'}
             </div>
           </div>
           <div className='signerPermission localSetting' style={{ zIndex: 213 }}>
