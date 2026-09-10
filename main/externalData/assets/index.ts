@@ -2,6 +2,10 @@ import log from 'electron-log'
 
 import Pylon, { AssetType } from '@framelabs/pylon-client'
 
+import { getCmcApiKey } from '../../env'
+import { getAddress } from '../../../resources/utils'
+import { createCmcPriceFeed } from './cmc'
+
 import type { AssetId } from '@framelabs/pylon-client/dist/assetId'
 import type { UsdRate } from '../../provider/assets'
 import type { NativeCurrency, Rate, Token } from '../../store/state'
@@ -12,6 +16,14 @@ interface RateUpdate {
     usd: number
     usd_24h_change: number
   }
+}
+
+function isPricedUsd(value: number) {
+  return Number.isFinite(value) && value > 0
+}
+
+function tokenRateKeys(address: string) {
+  return Array.from(new Set([address, address.toLowerCase(), getAddress(address)]))
 }
 
 export default function rates(pylon: Pylon, store: Store) {
@@ -26,10 +38,16 @@ export default function rates(pylon: Pylon, store: Store) {
     setTokenRates: (rates: Record<Address, UsdRate>) => store.setRates(rates)
   }
 
+  let pylonActive = false
+  let lastChains: number[] = []
+  let lastAddress: Address | undefined
+
   function handleRatesUpdates(updates: RateUpdate[]) {
     if (updates.length === 0) return
 
-    const nativeCurrencyUpdates = updates.filter((u) => u.id.type === AssetType.NativeCurrency)
+    const nativeCurrencyUpdates = updates.filter(
+      (u) => u.id.type === AssetType.NativeCurrency && isPricedUsd(u.data.usd)
+    )
 
     if (nativeCurrencyUpdates.length > 0) {
       log.debug(`got currency rate updates for chains: ${nativeCurrencyUpdates.map((u) => u.id.chainId)}`)
@@ -42,20 +60,22 @@ export default function rates(pylon: Pylon, store: Store) {
       })
     }
 
-    const tokenUpdates = updates.filter((u) => u.id.type === AssetType.Token)
+    const tokenUpdates = updates.filter((u) => u.id.type === AssetType.Token && isPricedUsd(u.data.usd))
 
     if (tokenUpdates.length > 0) {
       log.debug(`got token rate updates for addresses: ${tokenUpdates.map((u) => u.id.address)}`)
 
       const tokenRates = tokenUpdates.reduce((allRates, update) => {
-        // address is always defined for tokens
         const address = update.id.address as string
-
-        allRates[address] = {
+        const rate = {
           usd: {
             price: update.data.usd,
             change24hr: update.data.usd_24h_change
           }
+        }
+
+        for (const key of tokenRateKeys(address)) {
+          allRates[key] = rate
         }
 
         return allRates
@@ -65,7 +85,13 @@ export default function rates(pylon: Pylon, store: Store) {
     }
   }
 
-  function updateSubscription(chains: number[], address?: Address) {
+  const cmc = createCmcPriceFeed(store, handleRatesUpdates, fallbackToPylon)
+
+  function useCmc() {
+    return Boolean(getCmcApiKey())
+  }
+
+  function subscribePylon(chains: number[], address?: Address) {
     const subscribedCurrencies = chains.map((chainId) => ({ type: AssetType.NativeCurrency, chainId }))
     const knownTokens = storeApi.getKnownTokens(address).filter((token) => chains.includes(token.chainId))
     const customTokens = storeApi
@@ -83,18 +109,53 @@ export default function rates(pylon: Pylon, store: Store) {
     setAssets([...subscribedCurrencies, ...subscribedTokens])
   }
 
-  function start() {
-    log.verbose('starting asset updates')
-
+  function startPylonRates() {
+    if (pylonActive) return
+    pylonActive = true
+    log.info('using Pylon for token USD rates')
     pylon.on('rates', handleRatesUpdates)
   }
 
+  function fallbackToPylon(reason: string) {
+    if (pylonActive) return
+    log.warn('CMC unavailable, falling back to Pylon', { reason })
+    cmc.stop()
+    startPylonRates()
+    subscribePylon(lastChains, lastAddress)
+  }
+
+  function updateSubscription(chains: number[], address?: Address) {
+    lastChains = chains
+    lastAddress = address
+
+    if (useCmc() && !pylonActive) {
+      cmc.updateSubscription(chains, address)
+      return
+    }
+
+    subscribePylon(chains, address)
+  }
+
+  function start() {
+    if (useCmc()) {
+      log.info('using CoinMarketCap for token USD rates; Pylon rates stay unused while CMC_API_KEY is set')
+      cmc.start()
+      return
+    }
+
+    log.verbose('starting asset updates')
+    startPylonRates()
+  }
+
   function stop() {
-    log.verbose('stopping asset updates')
+    cmc.stop()
 
-    pylon.off('rates', handleRatesUpdates)
-
-    pylon.rates([])
+    if (pylonActive) {
+      log.verbose('stopping asset updates')
+      pylon.off('rates', handleRatesUpdates)
+      pylon.rates([])
+      pylonActive = false
+    }
   }
 
   function setAssets(assetIds: AssetId[]) {

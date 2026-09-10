@@ -6,6 +6,7 @@ import url from 'url'
 // DO NOT MOVE - env var below is required for app init and must be set before all local imports
 process.env.BUNDLE_LOCATION = process.env.BUNDLE_LOCATION || path.resolve(__dirname, './../..', 'bundle')
 
+import './env'
 import './identity'
 import * as errors from './errors'
 import windows from './windows'
