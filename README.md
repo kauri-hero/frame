@@ -13,13 +13,16 @@
   <a href="#features">Features</a> ⁃
   <a href="#installation">Installation</a> ⁃
   <a href="#usage">Usage</a> ⁃
-  <a href="#related">Related</a>
+  <a href="#related">Related</a> ⁃
+  <a href="FORK.md">Community fork</a>
 </h5>
 <br>
 
 <img src="/asset/png/FrameExample0-6-3.png?raw=true" />
 
 Frame is a web3 platform that creates a secure system-wide interface to your chains and accounts. Now any browser, command-line, or native application has the ability to access web3.
+
+This repository is an unofficial community fork of [Frame](https://github.com/floating/frame). It can be installed alongside official Frame (separate app id and userData). See [FORK.md](./FORK.md) for what this fork adds and how to run it.
 
 ### Features
 
@@ -81,6 +84,8 @@ If you use an arch-based distro, you can use an AUR Helper like [yay](https://gi
 › npm run bundle # Create bundle
 › npm run build # Build Frame for current platform
 ```
+
+On Windows, this fork’s local install is `npm run package:win` (see [FORK.md](./FORK.md)). Do not use the unix `npm run build` script in cmd.exe.
 
 ### Usage
 

@@ -28,7 +28,13 @@ const PreferencesSchema = {
     .describe("Lock an account when it's closed instead of when Frame restarts"),
   showLocalNameWithENS: z.boolean(),
   menubarGasPrice: z.boolean().default(false).describe('Show gas price in menu bar'),
-  hardwareDerivation: z.string()
+  hardwareDerivation: z.string(),
+  pylonEnabled: z.boolean().default(true).describe('Use Pylon as the default RPC preset'),
+  publicEndpointsEnabled: z.boolean().default(false).describe('Show public RPC endpoints as a selectable connection type'),
+  cmcPriceApiEnabled: z
+    .boolean()
+    .optional()
+    .describe('Use CoinMarketCap for USD rates instead of Pylon when a key is available')
 }
 
 const notificationTypes = z.enum([

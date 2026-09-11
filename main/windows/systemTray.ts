@@ -60,7 +60,7 @@ export class SystemTray {
     { displaySummonShortcut = false, accelerator = 'Alt+/', switchScreen = false }
   ) {
     const separatorMenuItem = {
-      label: 'Frame',
+      label: 'Frame Fork',
       click: () => {},
       type: 'separator'
     }
@@ -73,7 +73,7 @@ export class SystemTray {
     const actionMenuItem: Electron.MenuItemConstructorOptions = {
       label,
       click: () => this.clickHandlers[eventName as keyof typeof this.clickHandlers](),
-      toolTip: `${label} Frame`
+      toolTip: `${label} Frame Fork`
     }
     const quitMenuItem = {
       label: 'Quit',

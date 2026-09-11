@@ -1,3 +1,4 @@
+import '../../identity'
 import path from 'path'
 import electron from 'electron'
 import Conf, { Options } from 'conf'

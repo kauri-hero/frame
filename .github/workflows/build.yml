@@ -1,5 +1,10 @@
 name: Build and publish installer artifacts for all platforms
 
+# Inherited from floating/frame. This community fork must not create GitHub
+# Releases or electron-builder publish artifacts for official Frame. Upstream
+# secrets (Apple notarize, Windows CSC, NPM_AUTH_TOKEN) are not expected here.
+# Local Windows packages use `npm run package:win` — see FORK.md.
+
 on:
   push:
     branches:
@@ -10,6 +15,7 @@ env:
 
 jobs:
   create_draft_release:
+    if: github.repository == 'floating/frame'
     runs-on: ubuntu-latest
 
     steps:
@@ -31,6 +37,7 @@ jobs:
           title: ${{ steps.package-version.outputs.current-version }}
 
   build_release:
+    if: github.repository == 'floating/frame'
     needs: [create_draft_release]
     strategy:
       fail-fast: false

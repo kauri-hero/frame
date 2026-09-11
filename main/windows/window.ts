@@ -85,7 +85,8 @@ const externalWhitelist = [
   'https://discord.gg/UH7NGqY',
   'https://frame.canny.io',
   'https://feedback.frame.sh',
-  'https://opensea.io'
+  'https://opensea.io',
+  'https://coinmarketcap.com/api/documentation/guides/get-latest-crypto-prices'
 ]
 
 const isValidReleasePage = (url: string) => url.startsWith('https://github.com/floating/frame/releases/tag/')
