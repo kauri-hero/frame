@@ -14,6 +14,14 @@ Only one of the two apps can listen on the local JSON-RPC port at a time. Both u
 - **Pylon RPC toggle.** Pylon remains the default RPC preset. It can be turned off in Settings if those endpoints are unreachable.
 - **CMC Price API.** Optional [CoinMarketCap](https://coinmarketcap.com/api/documentation/guides/get-latest-crypto-prices) quotes when upstream Pylon USD rates are stale. This is off until you opt in.
 
+## Versioning
+
+Community builds keep the upstream Frame `x.y.z` they were forked from. The `-ce.N` pre-release label is this fork’s increment (`ce` = community edition).
+
+The first community cut on a given upstream is `-ce.1`. Later community-only changes on the same upstream bump `N`. After merging a newer upstream Frame, take that new `x.y.z` and start `-ce.1` again.
+
+This avoids occupying official Frame’s next number — do not ship `0.7.0` as if it were upstream. Under semver, `0.6.11-ce.1` sorts older than a future official `0.6.12` or `0.7.0`, which is intended.
+
 ## CoinMarketCap prices
 
 Settings → **CMC Price API**:
