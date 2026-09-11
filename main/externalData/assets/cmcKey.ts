@@ -188,7 +188,8 @@ function writeKeyFile(filePath: string, buf: Buffer) {
   fs.mkdirSync(dir, { recursive: true })
 
   const tmp = `${filePath}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, buf, { mode: 0o600 })
+  // Buffer ≠ DOM ArrayBufferView in current TS/Electron typings; view the same bytes (pooled offset).
+  fs.writeFileSync(tmp, new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength), { mode: 0o600 })
   try {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
     fs.renameSync(tmp, filePath)
