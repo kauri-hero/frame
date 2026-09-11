@@ -85,6 +85,8 @@ If you use an arch-based distro, you can use an AUR Helper like [yay](https://gi
 › npm run build # Build Frame for current platform
 ```
 
+On Windows, this fork’s local install is `npm run package:win` (see [FORK.md](./FORK.md)). Do not use the unix `npm run build` script in cmd.exe.
+
 ### Usage
 
 #### Connect to Frame natively

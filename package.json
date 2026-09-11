@@ -38,6 +38,8 @@
     "compile": "npm run copy-assets && tsc --project tsconfig.build.json",
     "compile:watch": "npm run copy-assets && tsc --project tsconfig.build.json -w",
     "build": "npm run compile && sleep 4 && npm run bundle && sleep 4 && electron-builder --config=build/electron-builder-standard.js",
+    "package:win": "node ./scripts/package-win.mjs",
+    "package:win:dir": "node ./scripts/package-win.mjs --dir",
     "copy-assets": "shx mkdir -p ./compiled/main/windows && shx cp ./main/windows/*.png ./compiled/main/windows",
     "parcel:build": "parcel build --no-autoinstall --public-url .",
     "publish": "electron-builder -c.snap.publish=github --config=build/electron-builder-standard.js",
