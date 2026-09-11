@@ -5,6 +5,7 @@ import store from '../store'
 import Inventory from './inventory'
 import Rates from './assets'
 import Balances from './balances'
+import { onCmcKeyChange } from './assets/cmcKey'
 import { arraysMatch, debounce } from '../../resources/utils'
 
 import type { Chain, Token } from '../store/state'
@@ -39,6 +40,21 @@ export default function () {
   inventory.start()
   rates.start()
   balances.start()
+
+  const stopWatchingCmcKey = onCmcKeyChange(() => {
+    rates.applyResolvedKey?.()
+  })
+
+  let cmcToggleTimer: NodeJS.Timeout | undefined
+  const cmcToggleObserver = store.observer(() => {
+    store('main.cmcPriceApiEnabled')
+    // Apply outside the observer so token/store reads inside applyResolvedKey
+    // are not tracked as extra dependencies.
+    clearTimeout(cmcToggleTimer)
+    cmcToggleTimer = setTimeout(() => {
+      rates.applyResolvedKey?.()
+    }, 0)
+  }, 'externalData:cmcPriceApi')
 
   const handleNetworkUpdate = debounce((newlyConnected: number[]) => {
     log.verbose('updating external data due to network update(s)', { connectedChains, newlyConnected })
@@ -124,6 +140,9 @@ export default function () {
       customTokensObserver.remove()
       trayObserver.remove()
 
+      stopWatchingCmcKey()
+      cmcToggleObserver.remove()
+      if (cmcToggleTimer) clearTimeout(cmcToggleTimer)
       inventory.stop()
       rates.stop()
       balances.stop()

@@ -11,8 +11,8 @@ export const showUnhandledExceptionDialog = (message: string, code?: string) => 
 
   if (code === 'EADDRINUSE') {
     dialog.showErrorBox(
-      'Frame is already running',
-      'Frame is already running or another application is using port 1248.'
+      'Frame Fork is already running',
+      'Frame Fork is already running or another application is using port 1248.'
     )
   } else {
     exitAction = dialog.showMessageBoxSync(undefined as unknown as BrowserWindow, {

@@ -1,4 +1,4 @@
-import { app, ipcMain, protocol, clipboard, powerMonitor, BrowserWindow } from 'electron'
+import { app, ipcMain, protocol, clipboard, BrowserWindow } from 'electron'
 import path from 'path'
 import log from 'electron-log'
 import url from 'url'
@@ -6,6 +6,8 @@ import url from 'url'
 // DO NOT MOVE - env var below is required for app init and must be set before all local imports
 process.env.BUNDLE_LOCATION = process.env.BUNDLE_LOCATION || path.resolve(__dirname, './../..', 'bundle')
 
+import './env'
+import './identity'
 import * as errors from './errors'
 import windows from './windows'
 import menu from './menu'
@@ -21,6 +23,13 @@ import { openBlockExplorer, openExternal } from './windows/window'
 import { FrameInstance } from './windows/frames/frameInstances'
 import Erc20Contract from './contracts/erc20'
 import { getErrorCode } from '../resources/utils'
+import {
+  clearSettingsCmcApiKey,
+  getCmcKeyStatus,
+  loadSettingsCmcApiKey,
+  resolveCmcApiKey,
+  setSettingsCmcApiKey
+} from './externalData/assets/cmcKey'
 
 app.commandLine.appendSwitch('enable-accelerated-2d-canvas', 'true')
 app.commandLine.appendSwitch('enable-gpu-rasterization', 'true')
@@ -76,22 +85,6 @@ process.on('uncaughtException', (e) => {
 process.on('unhandledRejection', (e) => {
   log.error('Unhandled Rejection!', e)
 })
-
-function startUpdater() {
-  powerMonitor.on('resume', () => {
-    log.debug('System resuming, starting updater')
-
-    updater.start()
-  })
-
-  powerMonitor.on('suspend', () => {
-    log.debug('System suspending, stopping updater')
-
-    updater.stop()
-  })
-
-  updater.start()
-}
 
 global.eval = () => {
   throw new Error(`This app does not support global.eval()`)
@@ -194,6 +187,18 @@ ipcMain.on('tray:switchChain', (e, type, id, req) => {
   accounts.resolveRequest(req)
 })
 
+ipcMain.handle('tray:cmcKeyStatus', () => getCmcKeyStatus())
+
+ipcMain.handle('tray:setCmcApiKey', (_e, key: unknown) => {
+  const result = setSettingsCmcApiKey(key)
+  if (!result.ok) {
+    log.warn('CMC Settings key not saved', { reason: result.error })
+  }
+  return result
+})
+
+ipcMain.handle('tray:clearCmcApiKey', () => clearSettingsCmcApiKey())
+
 ipcMain.handle('tray:getTokenDetails', async (e, contractAddress, chainId) => {
   try {
     const contract = new Erc20Contract(contractAddress, chainId)
@@ -247,10 +252,6 @@ ipcMain.on('tray:syncPath', (e, path, value) => {
 
 ipcMain.on('tray:ready', () => {
   require('./api')
-
-  if (!isDev) {
-    startUpdater()
-  }
 })
 
 ipcMain.on('tray:updateRestart', () => {
@@ -304,6 +305,12 @@ ipcMain.on('*:addFrame', (e, id) => {
 })
 
 app.on('ready', () => {
+  loadSettingsCmcApiKey()
+  if (store('main.cmcPriceApiEnabled') === undefined) {
+    // First run: enable CMC only when a key already exists so current CMC users keep CMC.
+    // Otherwise leave it off so Pylon prices remain available until the user opts in.
+    store.setCmcPriceApiEnabled(Boolean(resolveCmcApiKey()))
+  }
   menu()
   windows.init()
   if (app.dock) app.dock.hide()

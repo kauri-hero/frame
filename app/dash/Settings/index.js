@@ -28,6 +28,40 @@ const EditShortcut = styled.div`
   }
 `
 
+const DocsLink = styled.div`
+  background: var(--ghostC);
+  height: 20px;
+  min-width: 60px;
+  padding: 0 10px;
+  margin-right: 6px;
+  margin-left: 12px;
+  margin-top: 4px;
+  border-radius: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 500;
+`
+
+const ActionLink = styled(DocsLink)`
+  margin-left: 0;
+  margin-top: 8px;
+  opacity: ${(props) => (props.$disabled ? 0.45 : 1)};
+  pointer-events: ${(props) => (props.$disabled ? 'none' : 'auto')};
+  background: ${(props) => (props.$accent ? 'var(--good)' : 'var(--ghostC)')};
+  color: ${(props) => (props.$accent ? 'var(--goodOver)' : 'inherit')};
+`
+
+const CMC_QUOTES_LATEST_DOCS = 'https://coinmarketcap.com/api/documentation/guides/get-latest-crypto-prices'
+const isDev = process.env.NODE_ENV === 'development'
+
+function cmcSavedKeyHint(last4) {
+  return last4 ? `Saved on this machine ····${last4}` : 'Saved on this machine'
+}
+
 class Settings extends Component {
   constructor(props, context) {
     super(props, context)
@@ -36,8 +70,115 @@ class Settings extends Component {
     this.state = {
       latticeEndpoint,
       latticeEndpointMode,
-      resetConfirm: false
+      resetConfirm: false,
+      cmcKeyInput: '',
+      cmcKeyDirty: false,
+      cmcKeyStatus: { source: 'none' },
+      cmcKeyError: '',
+      cmcKeyBusy: false
     }
+  }
+
+  componentDidMount() {
+    this.refreshCmcKeyStatus()
+  }
+
+  refreshCmcKeyStatus = async () => {
+    try {
+      const status = await link.invoke('tray:cmcKeyStatus')
+      this.setState({ cmcKeyStatus: status && status.source ? status : { source: 'none' } })
+    } catch (e) {
+      this.setState((prev) => ({
+        cmcKeyStatus: prev.cmcKeyStatus && prev.cmcKeyStatus.source ? prev.cmcKeyStatus : { source: 'none' },
+        cmcKeyError: prev.cmcKeyError || 'Could not read CMC key status'
+      }))
+    }
+  }
+
+  saveCmcKey = async () => {
+    if (this.state.cmcKeyBusy || this.state.cmcKeyStatus.source === 'env') return
+    if (!this.state.cmcKeyDirty && this.state.cmcKeyStatus.source === 'settings') return
+
+    const key = (this.state.cmcKeyInput || '').trim()
+    if (!key) {
+      this.setState({ cmcKeyError: 'Enter a CoinMarketCap API key' })
+      return
+    }
+
+    this.setState({ cmcKeyBusy: true, cmcKeyError: '' })
+    try {
+      const result = await link.invoke('tray:setCmcApiKey', key)
+      if (result && result.ok) {
+        this.setState({
+          cmcKeyInput: '',
+          cmcKeyDirty: false,
+          cmcKeyStatus: result.status || { source: 'settings' },
+          cmcKeyBusy: false,
+          cmcKeyError: ''
+        })
+        await this.refreshCmcKeyStatus()
+        return
+      }
+      this.setState({
+        cmcKeyBusy: false,
+        cmcKeyError: (result && result.error) || 'Could not save API key',
+        cmcKeyStatus: (result && result.status) || this.state.cmcKeyStatus
+      })
+      await this.refreshCmcKeyStatus()
+    } catch (e) {
+      this.setState({ cmcKeyBusy: false, cmcKeyError: 'Could not save API key' })
+      await this.refreshCmcKeyStatus()
+    }
+  }
+
+  clearCmcKey = async () => {
+    if (this.state.cmcKeyBusy || this.state.cmcKeyStatus.source === 'env') return
+
+    this.setState({ cmcKeyBusy: true, cmcKeyError: '', cmcKeyInput: '', cmcKeyDirty: true })
+    try {
+      const result = await link.invoke('tray:clearCmcApiKey')
+      this.setState({
+        cmcKeyInput: '',
+        cmcKeyDirty: true,
+        cmcKeyStatus: (result && result.status) || { source: 'none' },
+        cmcKeyBusy: false,
+        cmcKeyError: (result && result.error) || ''
+      })
+      await this.refreshCmcKeyStatus()
+    } catch (e) {
+      this.setState({
+        cmcKeyBusy: false,
+        cmcKeyDirty: true,
+        cmcKeyError: 'Could not clear API key',
+        cmcKeyStatus: { source: 'none' }
+      })
+      await this.refreshCmcKeyStatus()
+    }
+  }
+
+  handleCmcKeyInputChange = (e) => {
+    const value = e.target.value
+    const source = (this.state.cmcKeyStatus && this.state.cmcKeyStatus.source) || 'none'
+    const hint = cmcSavedKeyHint(this.state.cmcKeyStatus && this.state.cmcKeyStatus.last4)
+    const hasSaved = source === 'settings'
+    const dirty = this.state.cmcKeyDirty
+
+    if (!dirty && hasSaved) {
+      if (!value || value === hint || hint.startsWith(value)) {
+        this.setState({ cmcKeyInput: '', cmcKeyDirty: false, cmcKeyError: '' })
+        return
+      }
+      const draft = value.startsWith(hint) ? value.slice(hint.length) : value
+      this.setState({ cmcKeyInput: draft, cmcKeyDirty: true, cmcKeyError: '' })
+      return
+    }
+
+    if (hasSaved && value === '') {
+      this.setState({ cmcKeyInput: '', cmcKeyDirty: false, cmcKeyError: '' })
+      return
+    }
+
+    this.setState({ cmcKeyInput: value, cmcKeyDirty: true, cmcKeyError: '' })
   }
 
   inputLatticeEndpoint(e) {
@@ -52,6 +193,73 @@ class Settings extends Component {
     )
   }
 
+  isCmcPriceApiEnabled() {
+    const stored = this.store('main.cmcPriceApiEnabled')
+    if (stored === true) return true
+    if (stored === false) return false
+    const source = (this.state.cmcKeyStatus && this.state.cmcKeyStatus.source) || 'none'
+    return source !== 'none'
+  }
+
+  renderCmcKeyControls() {
+    const { cmcKeyInput, cmcKeyDirty, cmcKeyStatus, cmcKeyError, cmcKeyBusy } = this.state
+    const source = (cmcKeyStatus && cmcKeyStatus.source) || 'none'
+    const last4 = cmcKeyStatus && cmcKeyStatus.last4
+    const envLocked = source === 'env'
+    const hasSaved = source === 'settings'
+    const showHint = hasSaved && !cmcKeyDirty
+    const hint = cmcSavedKeyHint(last4)
+    const inputValue = showHint ? hint : cmcKeyInput
+    const saveLabel = showHint ? 'Saved' : 'Save'
+
+    const docs = (
+      <ActionLink onClick={() => link.send('tray:openExternal', CMC_QUOTES_LATEST_DOCS)}>Docs</ActionLink>
+    )
+
+    if (envLocked) {
+      return (
+        <>
+          <div style={{ marginTop: 8 }}>{'Using env (`CMC_API_KEY`)'}</div>
+          <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap' }}>{docs}</div>
+        </>
+      )
+    }
+
+    return (
+      <>
+        <div className='connectionCustomInput connectionCustomInputOn' style={{ position: 'relative' }}>
+          <input
+            type={showHint ? 'text' : 'password'}
+            tabIndex='-1'
+            autoComplete='off'
+            spellCheck='false'
+            placeholder='CoinMarketCap API key'
+            value={inputValue}
+            disabled={cmcKeyBusy}
+            onChange={this.handleCmcKeyInputChange}
+            onFocus={(e) => {
+              if (showHint) e.target.select()
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') this.saveCmcKey()
+            }}
+          />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap' }}>
+          <ActionLink $disabled={cmcKeyBusy} $accent={cmcKeyDirty} onClick={this.saveCmcKey}>
+            {saveLabel}
+          </ActionLink>
+          <ActionLink $disabled={cmcKeyBusy} onClick={this.clearCmcKey}>
+            Clear
+          </ActionLink>
+          {docs}
+        </div>
+        {source === 'none' ? <div style={{ marginTop: 6 }}>{'No key — price feed off'}</div> : null}
+        {cmcKeyError ? <div style={{ marginTop: 6 }}>{cmcKeyError}</div> : null}
+      </>
+    )
+  }
+
   render() {
     const summonShortcut = this.store('main.shortcuts.summon')
     const platform = this.store('platform')
@@ -59,7 +267,73 @@ class Settings extends Component {
     return (
       <div className={'localSettings cardShow'}>
         <div className='localSettingsWrap'>
+          <div className='signerPermission localSetting' style={{ zIndex: 215 }}>
+            <div className='signerPermissionControls'>
+              <div className='signerPermissionSetting'>Pylon RPC</div>
+              <div
+                className={
+                  this.store('main.pylonEnabled') !== false
+                    ? 'signerPermissionToggle signerPermissionToggleOn'
+                    : 'signerPermissionToggle'
+                }
+                onClick={() =>
+                  link.send('tray:action', 'setPylonEnabled', this.store('main.pylonEnabled') === false)
+                }
+              >
+                <div className='signerPermissionToggleSwitch' />
+              </div>
+            </div>
+            <div className='signerPermissionDetails'>
+              {'Use Pylon as the default RPC preset. Disable if Pylon endpoints are unreachable or causing connection issues.'}
+            </div>
+          </div>
           <div className='signerPermission localSetting' style={{ zIndex: 214 }}>
+            <div className='signerPermissionControls'>
+              <div className='signerPermissionSetting'>Public RPC</div>
+              <div
+                className={
+                  this.store('main.publicEndpointsEnabled')
+                    ? 'signerPermissionToggle signerPermissionToggleOn'
+                    : 'signerPermissionToggle'
+                }
+                onClick={() =>
+                  link.send('tray:action', 'setPublicEndpointsEnabled', !this.store('main.publicEndpointsEnabled'))
+                }
+              >
+                <div className='signerPermissionToggleSwitch' />
+              </div>
+            </div>
+            <div className='signerPermissionDetails'>
+              {'Make public RPC endpoints an option. Public endpoints are operated by third parties — they receive your IP address & request data. Only enable accept these privacy tradeoffs.'}
+            </div>
+          </div>
+          <div className='signerPermission localSetting' style={{ zIndex: 213 }}>
+            <div className='signerPermissionControls'>
+              <div className='signerPermissionSetting'>CMC Price API</div>
+              <div
+                className={
+                  this.isCmcPriceApiEnabled()
+                    ? 'signerPermissionToggle signerPermissionToggleOn'
+                    : 'signerPermissionToggle'
+                }
+                onClick={() =>
+                  link.send('tray:action', 'setCmcPriceApiEnabled', !this.isCmcPriceApiEnabled())
+                }
+              >
+                <div className='signerPermissionToggleSwitch' />
+              </div>
+            </div>
+            <div className='signerPermissionDetails' style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+              <div>
+                {
+                  'Bring your own CoinMarketCap API key so Frame Fork can fetch token and native USD prices.'
+                }
+                {isDev ? ' CMC_API_KEY env var wins over a key saved here.' : null}
+              </div>
+              {this.isCmcPriceApiEnabled() ? this.renderCmcKeyControls() : null}
+            </div>
+          </div>
+          <div className='signerPermission localSetting' style={{ zIndex: 213 }}>
             <div className='signerPermissionControls'>
               <div className='signerPermissionSetting'>
                 <span style={{ position: 'relative' }}>

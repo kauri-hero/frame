@@ -7,6 +7,8 @@ import {
   IpcMainEvent,
   WebContents
 } from 'electron'
+import fs from 'fs'
+import http from 'http'
 import path from 'path'
 import log from 'electron-log'
 import EventEmitter from 'events'
@@ -24,14 +26,19 @@ type Windows = { [key: string]: BrowserWindow }
 const events = new EventEmitter()
 const frameManager = new FrameManager()
 const isDev = process.env.NODE_ENV === 'development'
-const devToolsEnabled = isDev || process.env.ENABLE_DEV_TOOLS === 'true'
-const fullheight = !!process.env.FULL_HEIGHT
+// Dev: detached DevTools on unless OPEN_DEVTOOLS / ENABLE_DEV_TOOLS is 'false'.
+// Prod: off unless either flag is 'true'. Never dock — docking stretches the 400px tray.
+const shouldOpenDevTools = (() => {
+  const flag = process.env.OPEN_DEVTOOLS ?? process.env.ENABLE_DEV_TOOLS
+  if (flag === 'false') return false
+  if (flag === 'true') return true
+  return isDev
+})()
 const openedAtLogin =
   electronApp?.getLoginItemSettings() && electronApp.getLoginItemSettings().wasOpenedAtLogin
 const windows: Windows = {}
 const showOnReady = true
 const trayWidth = 400
-const devHeight = 800
 const isWindows = process.platform === 'win32'
 const isMacOS = process.platform === 'darwin'
 
@@ -120,14 +127,93 @@ const detectMouse = () => {
   }, 50)
 }
 
-function initWindow(id: string, opts: Electron.BrowserWindowConstructorOptions) {
-  // in development, serve files from local filesystem instead of the created bundle
-  const url = isDev
-    ? `http://localhost:1234/${id}/index.dev.html`
-    : new URL(path.join(process.env.BUNDLE_LOCATION, `${id}.html`), 'file:')
+function bundledWindowUrl(id: string) {
+  return new URL(path.join(process.env.BUNDLE_LOCATION, `${id}.html`), 'file:').toString()
+}
 
+function parcelWindowUrl(id: string) {
+  return `http://localhost:1234/${id}/index.dev.html`
+}
+
+let parcelUiCheck: Promise<boolean> | undefined
+
+function isParcelUiAvailable() {
+  if (!parcelUiCheck) {
+    parcelUiCheck = new Promise((resolve) => {
+      const req = http.get('http://localhost:1234/tray/index.dev.html', (res) => {
+        res.resume()
+        resolve(res.statusCode === 200)
+      })
+      req.on('error', () => resolve(false))
+      req.setTimeout(1500, () => {
+        req.destroy()
+        resolve(false)
+      })
+    })
+  }
+
+  return parcelUiCheck
+}
+
+function attachDetachedDevTools(webContents: WebContents) {
+  if (!shouldOpenDevTools) return
+  webContents.openDevTools({ mode: 'detach' })
+}
+
+function initWindow(id: string, opts: Electron.BrowserWindowConstructorOptions) {
   windows[id] = createWindow(id, opts)
-  windows[id].loadURL(url.toString())
+
+  let usedBundleFallback = false
+
+  windows[id].webContents.on(
+    'did-fail-load',
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (!isMainFrame) return
+
+      log.error(`Failed to load ${id} window`, { errorCode, errorDescription, validatedURL })
+
+      const bundlePath = path.join(process.env.BUNDLE_LOCATION, `${id}.html`)
+      if (!isDev || usedBundleFallback || !validatedURL.includes('localhost:1234')) return
+      if (!fs.existsSync(bundlePath)) {
+        log.error(
+          `Cannot load ${id} UI. Run npm run dev (Parcel + Electron), or npm run bundle && npm run launch.`
+        )
+        return
+      }
+
+      usedBundleFallback = true
+      log.warn(`Parcel did not serve ${id}; loading bundled UI. For live reload run: npm run dev`)
+      windows[id].loadURL(bundledWindowUrl(id))
+    }
+  )
+
+  if (!isDev) {
+    windows[id].loadURL(bundledWindowUrl(id))
+    return
+  }
+
+  void isParcelUiAvailable().then((parcelUp) => {
+    if (windows[id].isDestroyed()) return
+
+    if (parcelUp) {
+      windows[id].loadURL(parcelWindowUrl(id))
+      return
+    }
+
+    const bundlePath = path.join(process.env.BUNDLE_LOCATION, `${id}.html`)
+    if (fs.existsSync(bundlePath)) {
+      usedBundleFallback = true
+      log.warn(
+        `Parcel UI server is not running on http://localhost:1234 — loading bundled ${id} UI. For live reload run: npm run dev`
+      )
+      windows[id].loadURL(bundledWindowUrl(id))
+      return
+    }
+
+    log.error(
+      `Cannot load ${id} UI: Parcel is not running and ${bundlePath} is missing. From the repo root run: npm run dev`
+    )
+  })
 }
 
 function initTrayWindow() {
@@ -170,9 +256,7 @@ function initTrayWindow() {
     })
   }, 2000)
 
-  if (devToolsEnabled) {
-    windows.tray.webContents.openDevTools()
-  }
+  attachDetachedDevTools(windows.tray.webContents)
 
   setTimeout(() => {
     windows.tray.on('blur', () => {
@@ -316,7 +400,7 @@ export class Tray {
     })
     windows.tray.setResizable(false) // Keeps height consistent
     const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea
-    const height = isDev && !fullheight ? devHeight : area.height
+    const height = area.height
     windows.tray.setMinimumSize(trayWidth, height)
     windows.tray.setSize(trayWidth, height)
     windows.tray.setMaximumSize(trayWidth, height)
@@ -405,7 +489,7 @@ class Dash {
       })
       windows.dash.setResizable(false) // Keeps height consistent
       const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea
-      const height = isDev && !fullheight ? devHeight : area.height
+      const height = area.height
       windows.dash.setMinimumSize(trayWidth, height)
       windows.dash.setSize(trayWidth, height)
       windows.dash.setMaximumSize(trayWidth, height)
@@ -418,9 +502,7 @@ class Dash {
         visibleOnFullScreen: true,
         skipTransformProcessType: true
       })
-      if (devToolsEnabled) {
-        windows.dash.webContents.openDevTools()
-      }
+      attachDetachedDevTools(windows.dash.webContents)
     }, 10)
   }
 
@@ -468,7 +550,7 @@ class Onboard {
       windows.onboard.once('close', closeHandler)
 
       const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea
-      const height = (isDev && !fullheight ? devHeight : area.height) - 160
+      const height = area.height - 160
       const maxWidth = Math.floor(height * 1.24)
       const targetWidth = 600 // area.width - 460
       const width = targetWidth > maxWidth ? maxWidth : targetWidth
@@ -486,9 +568,7 @@ class Onboard {
         visibleOnFullScreen: true,
         skipTransformProcessType: true
       })
-      if (devToolsEnabled) {
-        windows.onboard.webContents.openDevTools()
-      }
+      attachDetachedDevTools(windows.onboard.webContents)
     }, 10)
   }
 }
@@ -567,9 +647,7 @@ class Notify {
         visibleOnFullScreen: true,
         skipTransformProcessType: true
       })
-      if (devToolsEnabled) {
-        windows.notify.webContents.openDevTools()
-      }
+      attachDetachedDevTools(windows.notify.webContents)
     }, 10)
   }
 }
@@ -610,6 +688,9 @@ if (isDev) {
 
 ipcMain.on('*:contextmenu', (e, x, y) => {
   if (isDev) {
+    if (!e.sender.isDevToolsOpened()) {
+      e.sender.openDevTools({ mode: 'detach' })
+    }
     e.sender.inspectElement(x, y)
   }
 })

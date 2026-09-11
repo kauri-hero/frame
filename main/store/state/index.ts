@@ -137,6 +137,10 @@ const mainState: M = {
   accountCloseLock: main('accountCloseLock', false),
   hardwareDerivation: main('hardwareDerivation', 'mainnet'),
   menubarGasPrice: main('menubarGasPrice', false),
+  pylonEnabled: main('pylonEnabled', true),
+  publicEndpointsEnabled: main('publicEndpointsEnabled', false),
+  // Unset until first persist: enabled if a CMC key already exists, otherwise off (Pylon).
+  cmcPriceApiEnabled: main('cmcPriceApiEnabled', undefined),
   lattice: main('lattice', {}),
   latticeSettings: {
     accountLimit: main('latticeSettings.accountLimit', 5),

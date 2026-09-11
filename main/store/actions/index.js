@@ -80,6 +80,9 @@ module.exports = {
       return Object.assign({}, secondary, status)
     })
   },
+  setPylonEnabled: (u, enabled) => u('main.pylonEnabled', () => enabled),
+  setPublicEndpointsEnabled: (u, enabled) => u('main.publicEndpointsEnabled', () => enabled),
+  setCmcPriceApiEnabled: (u, enabled) => u('main.cmcPriceApiEnabled', () => Boolean(enabled)),
   setLaunch: (u, launch) => u('main.launch', () => launch),
   toggleLaunch: (u) => u('main.launch', (launch) => !launch),
   toggleReveal: (u) => u('main.reveal', (reveal) => !reveal),
