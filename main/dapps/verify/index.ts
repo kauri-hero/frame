@@ -41,8 +41,17 @@ export function getDappCacheDir() {
   return path.join(app.getPath('userData'), 'DappCache')
 }
 
+export function getCachedDappPath(dappId: string) {
+  return path.join(getDappCacheDir(), dappId)
+}
+
+// Older persist snapshots stored content as `/ipfs/<cid>`; current records store the bare CID.
+export function normalizeContentCID(contentCID: string) {
+  return contentCID.replace(/^\/ipfs\//, '')
+}
+
 export async function dappPathExists(dappId: string) {
-  const cachedDappPath = `${getDappCacheDir()}/${dappId}`
+  const cachedDappPath = getCachedDappPath(dappId)
 
   try {
     await fs.access(cachedDappPath)
@@ -53,8 +62,8 @@ export async function dappPathExists(dappId: string) {
 }
 
 export async function isDappVerified(dappId: string, contentCID: string) {
-  const path = `${getDappCacheDir()}/${dappId}`
-  const cid = await getCID(path)
+  const cachedDappPath = getCachedDappPath(dappId)
+  const cid = await getCID(cachedDappPath)
 
-  return cid?.toV1().toString() === contentCID
+  return cid?.toV1().toString() === normalizeContentCID(contentCID)
 }

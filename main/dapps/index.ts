@@ -9,6 +9,7 @@ import store from '../store'
 import nebulaApi from '../nebula'
 import server from './server'
 import extractColors from '../windows/extractColors'
+import { activateVerifiedCache } from './cacheFallback'
 import { dappPathExists, getDappCacheDir, isDappVerified } from './verify'
 
 import type { Dapp } from '../store/state'
@@ -137,6 +138,12 @@ async function checkStatus(dappId: string) {
     if (openWhenReady) surface.open('dappLauncher', dapp.ens)
   } catch (e) {
     log.error('Check status error', e)
+
+    if (await activateVerifiedCache(dappId, dapp)) {
+      if (openWhenReady) surface.open('dappLauncher', dapp.ens)
+      return
+    }
+
     const retry = checkStatusRetryCount || 0
     if (retry < 4) {
       retryTimer = setTimeout(() => {
@@ -154,7 +161,10 @@ const refreshDapps = ({ statusFilter = '' } = {}) => {
   Object.keys(dapps || {})
     .filter((id) => !statusFilter || dapps[id].status === statusFilter)
     .forEach((id) => {
-      store.updateDapp(id, { status: 'loading' })
+      // Do not flip a working Send UI to loading while a background nebula/IPFS check runs.
+      if (dapps[id].status !== 'ready') {
+        store.updateDapp(id, { status: 'loading' })
+      }
       if (nebula.ready()) {
         checkStatus(id)
       } else {

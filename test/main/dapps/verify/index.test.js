@@ -1,8 +1,15 @@
+import path from 'path'
 import fs from 'fs/promises'
 import { importer } from 'ipfs-unixfs-importer'
 import { CID } from 'multiformats'
 
-import { dappPathExists, isDappVerified } from '../../../../main/dapps/verify'
+import {
+  dappPathExists,
+  getCachedDappPath,
+  getDappCacheDir,
+  isDappVerified,
+  normalizeContentCID
+} from '../../../../main/dapps/verify'
 
 jest.mock('fs', () => ({
   access: jest.fn()
@@ -20,6 +27,32 @@ jest.mock('ipfs-http-client', () => ({
   }
 }))
 
+describe('#getCachedDappPath', () => {
+  it('builds the cached dapp path with path.join, not a raw / concat', () => {
+    const dappId = '0xmydapp'
+    const joinSpy = jest.spyOn(path, 'join')
+
+    const result = getCachedDappPath(dappId)
+
+    expect(joinSpy).toHaveBeenCalledWith(getDappCacheDir(), dappId)
+    expect(result).toBe(path.join(getDappCacheDir(), dappId))
+
+    joinSpy.mockRestore()
+  })
+})
+
+describe('#normalizeContentCID', () => {
+  const cid = 'bafybeiag6x7b2xh3c23fochm565boiuygmomi3vqjxjad4wax5oldwh6bi'
+
+  it('leaves a bare CID unchanged', () => {
+    expect(normalizeContentCID(cid)).toBe(cid)
+  })
+
+  it('strips a leading /ipfs/ prefix from older persist records', () => {
+    expect(normalizeContentCID(`/ipfs/${cid}`)).toBe(cid)
+  })
+})
+
 describe('#dappPathExists', () => {
   beforeEach(() => {
     fs.access = jest.fn()
@@ -30,7 +63,7 @@ describe('#dappPathExists', () => {
 
     const exists = dappPathExists('0xmydapp')
 
-    expect(fs.access).toHaveBeenCalledWith(expect.toMatchPath('/home/user/.config/DappCache/0xmydapp'))
+    expect(fs.access).toHaveBeenCalledWith(path.join(getDappCacheDir(), '0xmydapp'))
     return expect(exists).resolves.toBe(true)
   })
 
@@ -39,7 +72,7 @@ describe('#dappPathExists', () => {
 
     const exists = dappPathExists('0xmydapp')
 
-    expect(fs.access).toHaveBeenCalledWith(expect.toMatchPath('/home/user/.config/DappCache/0xmydapp'))
+    expect(fs.access).toHaveBeenCalledWith(path.join(getDappCacheDir(), '0xmydapp'))
     return expect(exists).resolves.toBe(false)
   })
 })
@@ -56,17 +89,27 @@ describe('#isDappVerified', () => {
     return expect(isDappVerified('0xdapp', dappRootCid)).resolves.toBe(true)
   })
 
+  it('verifies the dapp if an older persist record stored the CID as /ipfs/<cid>', async () => {
+    return expect(isDappVerified('0xdapp', `/ipfs/${dappRootCid}`)).resolves.toBe(true)
+  })
+
   it('does not verify the dapp if the content does not match what is stored on disk', async () => {
     const contentCid = 'bagaaierasords4njcts6vs7qvdjfcvgnume4hqohf65zsfguprqphs3icwea'
 
     return expect(isDappVerified('0xdapp', contentCid)).resolves.toBe(false)
   })
 
+  it('does not verify a mismatched CID even when it has an /ipfs/ prefix', async () => {
+    const contentCid = 'bagaaierasords4njcts6vs7qvdjfcvgnume4hqohf65zsfguprqphs3icwea'
+
+    return expect(isDappVerified('0xdapp', `/ipfs/${contentCid}`)).resolves.toBe(false)
+  })
+
   it('looks in the dapp cache directory to verify the existing dapp content', async () => {
     await isDappVerified('0xdapp', dappRootCid)
 
     const contentSourceGlob = importer.mock.calls[0][0].getArgs()
-    expect(contentSourceGlob).toStrictEqual([expect.toMatchPath('/home/user/.config/DappCache/0xdapp'), '**'])
+    expect(contentSourceGlob).toStrictEqual([path.join(getDappCacheDir(), '0xdapp'), '**'])
   })
 })
 
