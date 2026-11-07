@@ -61,7 +61,7 @@ export function getCmcApiKey() {
   return (process.env.CMC_API_KEY || '').trim()
 }
 
-export function getCmcPollIntervalMs(fallback = 5 * 60_000, min = 60_000) {
+export function getCmcPollIntervalMs(fallback = 15 * 60_000, min = 60_000) {
   const parsed = parseInt(process.env.CMC_POLL_INTERVAL_MS || '', 10)
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback
   return Math.max(min, parsed)

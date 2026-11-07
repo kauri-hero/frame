@@ -20,7 +20,7 @@ Community builds keep the upstream Frame `x.y.z` they were forked from. The `-ce
 
 The first community cut on a given upstream is `-ce.1`. Later community-only changes on the same upstream bump `N`. After merging a newer upstream Frame, take that new `x.y.z` and start `-ce.1` again.
 
-This avoids occupying official Frame’s next number — do not ship `0.7.0` as if it were upstream. Under semver, `0.6.11-ce.1` sorts older than a future official `0.6.12` or `0.7.0`, which is intended.
+This avoids occupying official Frame’s next number — do not ship `0.7.0` as if it were upstream. Under semver, `0.6.11-ce.2` sorts older than a future official `0.6.12` or `0.7.0`, which is intended.
 
 ## CoinMarketCap prices
 
@@ -40,7 +40,7 @@ Keys can come from:
 1. **Settings** — entered in the dashboard and encrypted at rest with Electron `safeStorage` (OS keychain / DPAPI). The key is not written into the Conf `config.json` store.
 2. **`CMC_API_KEY` in `.env.local`** — for development. A non-empty env value wins over a Settings key.
 
-Polling is conservative (five minutes by default, never faster than once a minute) so a typical retail CMC plan can cover a small custom-token list.
+Polling is conservative (fifteen minutes by default while the app is in use, never faster than once a minute). Polling pauses while the app is hidden or the system is idle, locked, or asleep; last-good cached rates stay on screen. Catch-up polls after the priced-token list grows wait at least that one-minute floor so a growing list cannot burst `quotes/latest` every couple of seconds.
 
 Last-good quotes are cached in userData as `cmc-rates.json`. That file is a local price cache, not a secret. Do not put API keys in git, Conf, or this cache file. See `.env.example` for placeholders only.
 
@@ -51,7 +51,7 @@ Defined in `main/env.ts` and `@types/frame/environment.d.ts` (plus a few existin
 | Variable | Purpose |
 | --- | --- |
 | `CMC_API_KEY` | CoinMarketCap API key. Wins over a key saved in Settings. |
-| `CMC_POLL_INTERVAL_MS` | Quote poll interval. Default `300000` (5 minutes). Values under `60000` are clamped to 60 seconds. |
+| `CMC_POLL_INTERVAL_MS` | Quote poll interval while the app is in use. Default `900000` (15 minutes). Values under `60000` are clamped to 60 seconds. |
 | `CMC_MAX_TOKENS` | Max ERC-20s quoted per poll (natives are always included). Default `40`, max `200`. |
 | `LOG_LEVEL` | `electron-log` console level (`silly` / `debug` / `verbose` / `info` / `warn` / `error`). |
 | `OPEN_DEVTOOLS` | `true` / `false`. Detached Chromium DevTools. Dev defaults on unless `false`; production defaults off unless `true`. `ENABLE_DEV_TOOLS` is a fallback if `OPEN_DEVTOOLS` is unset. |
