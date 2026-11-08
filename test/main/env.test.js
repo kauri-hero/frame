@@ -28,7 +28,7 @@ describe('CMC env helpers', () => {
   })
 
   it('clamps the poll interval to at least one minute', () => {
-    expect(getCmcPollIntervalMs()).toBe(5 * 60_000)
+    expect(getCmcPollIntervalMs()).toBe(15 * 60_000)
 
     process.env.CMC_POLL_INTERVAL_MS = '10000'
     expect(getCmcPollIntervalMs()).toBe(60_000)

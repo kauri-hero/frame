@@ -16,8 +16,10 @@ import {
   isCmcQuoteSymbol,
   matchCmcId,
   MAX_EMPTY_TARGET_RETRIES,
+  MIN_POLL_GAP_MS,
   normalizeQuoteAssets,
   platformMatches,
+  RESUME_DEBOUNCE_MS,
   selectRateTargets,
   targetKey
 } from '../../../../main/externalData/assets/cmc'
@@ -61,7 +63,12 @@ describe('selectRateTargets', () => {
       maxTokens: 2,
       balances: [
         { chainId: 8453, address: VVV, balance: '0x10', symbol: 'VVV' },
-        { chainId: 8453, address: '0x1111111111111111111111111111111111111111', balance: '0x0', symbol: 'DUST' }
+        {
+          chainId: 8453,
+          address: '0x1111111111111111111111111111111111111111',
+          balance: '0x0',
+          symbol: 'DUST'
+        }
       ],
       customTokens: [{ chainId: 8453, address: '0x2222222222222222222222222222222222222222', symbol: 'FOO' }],
       knownTokens: [{ chainId: 1, address: '0x3333333333333333333333333333333333333333', symbol: 'BAR' }]
@@ -406,12 +413,12 @@ describe('CMC disk cache', () => {
     expect(loaded.dead.HOPELESS.reason).toBe('no-quote')
 
     const updates = cacheToRateUpdates(loaded)
-    expect(updates.map((update) => [update.id.type, update.id.chainId, update.id.address, update.data.usd])).toEqual(
-      [
-        [0, 1, undefined, 2460],
-        [1, 8453, VVV, 22.4]
-      ]
-    )
+    expect(
+      updates.map((update) => [update.id.type, update.id.chainId, update.id.address, update.data.usd])
+    ).toEqual([
+      [0, 1, undefined, 2460],
+      [1, 8453, VVV, 22.4]
+    ])
   })
 })
 
@@ -456,9 +463,30 @@ describe('CMC symbol backoff', () => {
 describe('CMC price feed cache and concurrency', () => {
   const ACCOUNT = '0x1111111111111111111111111111111111111111'
   const previousKey = process.env.CMC_API_KEY
+  const previousPollInterval = process.env.CMC_POLL_INTERVAL_MS
   let cacheDir
   let cachePath
   let feed
+
+  function createActivity(initial = false) {
+    let paused = initial
+    const listeners = []
+    return {
+      isPaused: () => paused,
+      subscribe: (listener) => {
+        listeners.push(listener)
+        return () => {
+          const index = listeners.indexOf(listener)
+          if (index >= 0) listeners.splice(index, 1)
+        }
+      },
+      setPaused(next) {
+        if (paused === next) return
+        paused = next
+        for (const listener of listeners) listener(next)
+      }
+    }
+  }
 
   function createStore() {
     const state = {
@@ -533,6 +561,7 @@ describe('CMC price feed cache and concurrency', () => {
 
   beforeEach(() => {
     process.env.CMC_API_KEY = 'test-cmc-key'
+    delete process.env.CMC_POLL_INTERVAL_MS
     cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmc-feed-'))
     cachePath = path.join(cacheDir, CMC_CACHE_FILENAME)
     jest.setSystemTime(1_700_000_000_000)
@@ -543,6 +572,8 @@ describe('CMC price feed cache and concurrency', () => {
     feed = undefined
     if (previousKey === undefined) delete process.env.CMC_API_KEY
     else process.env.CMC_API_KEY = previousKey
+    if (previousPollInterval === undefined) delete process.env.CMC_POLL_INTERVAL_MS
+    else process.env.CMC_POLL_INTERVAL_MS = previousPollInterval
     fs.rmSync(cacheDir, { recursive: true, force: true })
   })
 
@@ -705,7 +736,7 @@ describe('CMC price feed cache and concurrency', () => {
     expect(symbolSets).toEqual(expect.arrayContaining([['ETH'], ['VVV']]))
   })
 
-  it('catches up within seconds when more chains appear during a partial first poll', async () => {
+  it('does not schedule a credit-spending catch-up every 2 seconds when priced targets grow', async () => {
     const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
     const state = {
       main: {
@@ -749,9 +780,16 @@ describe('CMC price feed cache and concurrency', () => {
       }
     }
     await waitUntil(() => loadCmcCache(cachePath).rates['n:1']?.usd === 2460)
+    await jest.advanceTimersByTimeAsync(0)
     expect(loadCmcCache(cachePath).rates[`t:8453:${VVV}`]).toBeUndefined()
 
+    const afterFirst = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest')).length
     await jest.advanceTimersByTimeAsync(EMPTY_TARGET_RETRY_MS)
+    expect(started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))).toHaveLength(
+      afterFirst
+    )
+
+    await jest.advanceTimersByTimeAsync(MIN_POLL_GAP_MS)
 
     const catchUpCalls = started
       .filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
@@ -919,5 +957,112 @@ describe('CMC price feed cache and concurrency', () => {
 
     await jest.advanceTimersByTimeAsync(5 * 60_000)
     expect(loadCmcCache(cachePath).rates['n:1'].usd).toBe(2460)
+  })
+
+  it('does not call quotes/latest while minimized or idle and keeps the last-good cache', async () => {
+    saveCmcCache(cachePath, {
+      version: 1,
+      updatedAt: 1,
+      rates: {
+        'n:1': { type: 'native', chainId: 1, symbol: 'ETH', usd: 2460, usd_24h_change: 1 }
+      },
+      dead: {}
+    })
+
+    const activity = createActivity(true)
+    const onUpdates = jest.fn()
+    const started = pendingFetch()
+    feed = createCmcPriceFeed(createStore(), onUpdates, { cachePath, activity })
+    feed.updateSubscription([1, 8453], ACCOUNT)
+    feed.start()
+
+    expect(onUpdates).toHaveBeenCalled()
+    expect(loadCmcCache(cachePath).rates['n:1'].usd).toBe(2460)
+
+    await jest.advanceTimersByTimeAsync(FIRST_POLL_DELAY_MS)
+    await jest.advanceTimersByTimeAsync(15 * 60_000)
+    expect(started).toHaveLength(0)
+    expect(fetchWithTimeout).not.toHaveBeenCalled()
+    expect(loadCmcCache(cachePath).rates['n:1'].usd).toBe(2460)
+  })
+
+  it('polls every 15 minutes by default while active', async () => {
+    const started = pendingFetch()
+    feed = createCmcPriceFeed(createStore(), jest.fn(), { cachePath })
+    feed.updateSubscription([1, 8453], ACCOUNT)
+    feed.start()
+    await jest.advanceTimersByTimeAsync(FIRST_POLL_DELAY_MS)
+
+    const firstCalls = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+    expect(firstCalls.length).toBeGreaterThan(0)
+    for (const call of firstCalls) {
+      if (call.symbols.includes('ETH')) {
+        call.resolve(quoteBody([{ symbol: 'ETH', id: 1027, usd: 2460 }]))
+      } else {
+        call.resolve(quoteBody([{ symbol: 'VVV', id: 31848, usd: 22.4, address: VVV }]))
+      }
+    }
+    await waitUntil(() => loadCmcCache(cachePath).rates['n:1']?.usd === 2460)
+    await jest.advanceTimersByTimeAsync(0)
+
+    const afterFirst = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest')).length
+    await jest.advanceTimersByTimeAsync(14 * 60_000)
+    expect(started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))).toHaveLength(
+      afterFirst
+    )
+
+    await jest.advanceTimersByTimeAsync(60_000)
+    const secondCalls = started
+      .filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+      .slice(afterFirst)
+    expect(secondCalls.length).toBeGreaterThan(0)
+  })
+
+  it('resumes a poll after a pause only if the active interval has elapsed', async () => {
+    const activity = createActivity(false)
+    const started = pendingFetch()
+    feed = createCmcPriceFeed(createStore(), jest.fn(), { cachePath, activity })
+    feed.updateSubscription([1, 8453], ACCOUNT)
+    feed.start()
+    await jest.advanceTimersByTimeAsync(FIRST_POLL_DELAY_MS)
+
+    const firstCalls = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+    for (const call of firstCalls) {
+      if (call.symbols.includes('ETH')) {
+        call.resolve(quoteBody([{ symbol: 'ETH', id: 1027, usd: 2460 }]))
+      } else {
+        call.resolve(quoteBody([{ symbol: 'VVV', id: 31848, usd: 22.4, address: VVV }]))
+      }
+    }
+    await waitUntil(() => loadCmcCache(cachePath).rates['n:1']?.usd === 2460)
+    await jest.advanceTimersByTimeAsync(0)
+    const afterFirst = started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest')).length
+
+    activity.setPaused(true)
+    activity.setPaused(false)
+    await jest.advanceTimersByTimeAsync(RESUME_DEBOUNCE_MS)
+    expect(started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))).toHaveLength(
+      afterFirst
+    )
+
+    activity.setPaused(true)
+    await jest.advanceTimersByTimeAsync(15 * 60_000)
+    expect(started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))).toHaveLength(
+      afterFirst
+    )
+
+    activity.setPaused(false)
+    activity.setPaused(true)
+    activity.setPaused(false)
+    await jest.advanceTimersByTimeAsync(RESUME_DEBOUNCE_MS / 2)
+    expect(started.filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))).toHaveLength(
+      afterFirst
+    )
+
+    await jest.advanceTimersByTimeAsync(RESUME_DEBOUNCE_MS)
+    const resumeCalls = started
+      .filter((call) => call.url.includes('/v3/cryptocurrency/quotes/latest'))
+      .slice(afterFirst)
+    expect(resumeCalls.length).toBeGreaterThan(0)
   })
 })

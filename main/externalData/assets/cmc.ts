@@ -4,6 +4,7 @@ import { AssetType } from '@framelabs/pylon-client'
 
 import { getCmcMaxTokens, getCmcPollIntervalMs } from '../../env'
 import { resolveCmcApiKey } from './cmcKey'
+import { createCmcPollActivity, type CmcPollActivity } from './cmcPollActivity'
 import { NATIVE_CURRENCY } from '../../../resources/constants'
 import { fetchWithTimeout } from '../../../resources/utils/fetch'
 import {
@@ -63,12 +64,19 @@ const REQUEST_TIMEOUT_MS = 15_000
 const MIN_POLL_GAP_MS = 60_000
 const FIRST_POLL_DELAY_MS = 1_000
 const EMPTY_TARGET_RETRY_MS = 2_000
+const RESUME_DEBOUNCE_MS = 1_000
 const MAX_EMPTY_TARGET_RETRIES = 30
 const MAX_BACKOFF_MS = 30 * 60_000
 
-export { FIRST_POLL_DELAY_MS, EMPTY_TARGET_RETRY_MS, MAX_EMPTY_TARGET_RETRIES, MIN_POLL_GAP_MS }
+export {
+  FIRST_POLL_DELAY_MS,
+  EMPTY_TARGET_RETRY_MS,
+  MAX_EMPTY_TARGET_RETRIES,
+  MIN_POLL_GAP_MS,
+  RESUME_DEBOUNCE_MS
+}
 
-type PollResult = 'empty' | 'ok' | 'skipped'
+type PollResult = 'empty' | 'ok' | 'skipped' | 'paused'
 
 const CHAIN_PLATFORMS: Record<number, string[]> = {
   1: ['ethereum'],
@@ -253,7 +261,9 @@ export function selectRateTargets(opts: {
     ...new Set(
       asTokenList(opts.connectedChainIds)
         .map(asChainId)
-        .filter((chainId): chainId is number => Boolean(chainId && !opts.isTestnet(chainId) && isPricedChain(chainId)))
+        .filter((chainId): chainId is number =>
+          Boolean(chainId && !opts.isTestnet(chainId) && isPricedChain(chainId))
+        )
     )
   ]
   const priced = new Set(pricedChains)
@@ -342,14 +352,21 @@ export function selectRateTargets(opts: {
   const knownKept = knownFiller.slice(0, knownBudget)
   const selectedTokens = [...heldKept, ...customKept, ...knownKept]
   const skipped =
-    customTargets.length - customKept.length + heldTargets.length - heldKept.length + knownFiller.length - knownKept.length
+    customTargets.length -
+    customKept.length +
+    heldTargets.length -
+    heldKept.length +
+    knownFiller.length -
+    knownKept.length
 
   return {
     targets: [...natives, ...selectedTokens],
     natives: natives.length,
     tokens: selectedTokens.length,
     custom: customKept.length,
-    customSymbols: customKept.map((token) => token.symbol).filter((symbol): symbol is string => Boolean(symbol)),
+    customSymbols: customKept
+      .map((token) => token.symbol)
+      .filter((symbol): symbol is string => Boolean(symbol)),
     capped: skipped > 0,
     skipped
   }
@@ -428,8 +445,7 @@ export function extractUsdQuote(asset: {
     if (price === undefined || price <= 0) return
     return {
       usd: price,
-      usd_24h_change:
-        asNumber(entry?.percent_change_24h) ?? asNumber(entry?.percentChange24h) ?? 0
+      usd_24h_change: asNumber(entry?.percent_change_24h) ?? asNumber(entry?.percentChange24h) ?? 0
     }
   }
 
@@ -603,7 +619,8 @@ async function cmcRequest<T>(
   const numericError = asNumber(errorCode)
   const data = body.data as T
   const hasData =
-    data != null && (Array.isArray(data) ? data.length > 0 : typeof data === 'object' && Object.keys(data).length > 0)
+    data != null &&
+    (Array.isArray(data) ? data.length > 0 : typeof data === 'object' && Object.keys(data).length > 0)
   const failed = (!response.ok || (numericError !== undefined && numericError !== 0)) && !hasData
 
   if (failed) {
@@ -620,7 +637,7 @@ async function cmcRequest<T>(
 export function createCmcPriceFeed(
   store: Store,
   onUpdates: (updates: RateUpdate[]) => void,
-  opts?: { cachePath?: string }
+  opts?: { cachePath?: string; activity?: CmcPollActivity }
 ) {
   const storeApi = {
     getKnownTokens: (address?: Address) =>
@@ -650,10 +667,24 @@ export function createCmcPriceFeed(
   let backoffMs = MIN_POLL_GAP_MS
   let started = false
   let emptyTargetRetries = 0
-  let catchUpRetries = 0
   let completedTargetPoll = false
   let pendingCatchUp = false
   let lastPolledFingerprint = ''
+  let unsubscribeActivity: (() => void) | undefined
+
+  const activity: CmcPollActivity =
+    opts?.activity ||
+    (typeof store.observer === 'function'
+      ? createCmcPollActivity(store)
+      : { isPaused: () => false, subscribe: () => () => undefined })
+
+  function isPaused() {
+    try {
+      return activity.isPaused()
+    } catch {
+      return false
+    }
+  }
 
   function resolveCachePath() {
     return opts?.cachePath || getCmcCachePath()
@@ -781,7 +812,19 @@ export function createCmcPriceFeed(
     return Math.max(dueIn, backoffIn, minGap)
   }
 
+  function catchUpDelay() {
+    const now = Date.now()
+    const backoffIn = Math.max(0, backoffUntil - now)
+    if (!completedTargetPoll || !lastPollAt) {
+      return Math.max(backoffIn, FIRST_POLL_DELAY_MS)
+    }
+    const minGap = Math.max(0, lastPollAt + MIN_POLL_GAP_MS - now)
+    return Math.max(backoffIn, minGap)
+  }
+
   function scheduleAfterPoll(result: PollResult) {
+    if (isPaused() || result === 'paused') return
+
     if (result === 'empty') {
       emptyTargetRetries += 1
       if (emptyTargetRetries <= MAX_EMPTY_TARGET_RETRIES) {
@@ -802,24 +845,40 @@ export function createCmcPriceFeed(
     emptyTargetRetries = 0
 
     if (pendingCatchUp || currentFingerprint !== lastPolledFingerprint) {
-      catchUpRetries += 1
-      if (catchUpRetries <= MAX_EMPTY_TARGET_RETRIES) {
-        pendingCatchUp = false
-        log.info('CMC catch-up poll scheduled, priced targets grew', {
-          attempt: catchUpRetries,
-          delayMs: EMPTY_TARGET_RETRY_MS
-        })
-        schedule(Math.max(EMPTY_TARGET_RETRY_MS, backoffUntil - Date.now()))
-        return
-      }
       pendingCatchUp = false
-      log.info('CMC catch-up retries exhausted, falling back to poll interval', {
-        pollIntervalMs: pollInterval()
+      const delayMs = catchUpDelay()
+      log.info('CMC catch-up poll scheduled, priced targets grew', {
+        delayMs,
+        minGapMs: MIN_POLL_GAP_MS
       })
+      schedule(delayMs)
+      return
     }
 
-    catchUpRetries = 0
     schedule(nextDelay())
+  }
+
+  function handleActivity(paused: boolean) {
+    if (!started || !isEnabled()) return
+
+    if (paused) {
+      clearTimer()
+      log.info('CMC polling paused, keeping last-good cache')
+      return
+    }
+
+    if (inflight) return
+
+    if (!lastPollAt) {
+      if (!pollTimer) schedule(FIRST_POLL_DELAY_MS)
+      return
+    }
+
+    const stale = Date.now() - lastPollAt >= pollInterval()
+    schedule(stale ? RESUME_DEBOUNCE_MS : nextDelay())
+    if (stale) {
+      log.info('CMC polling resumed, last poll older than interval')
+    }
   }
 
   function emit(updates: RateUpdate[], persist = true) {
@@ -842,10 +901,7 @@ export function createCmcPriceFeed(
     })
   }
 
-  async function resolveUnpricedTokenIds(
-    tokens: Extract<RateTarget, { type: 'token' }>[],
-    key: string
-  ) {
+  async function resolveUnpricedTokenIds(tokens: Extract<RateTarget, { type: 'token' }>[], key: string) {
     const unresolved = tokens.filter((token) => {
       const cacheKey = tokenKey(token.chainId, token.address)
       return !idCache.has(cacheKey) && !missCache.has(cacheKey)
@@ -917,15 +973,16 @@ export function createCmcPriceFeed(
         .map(asChainId)
         .filter((chainId): chainId is number => Boolean(chainId && isPricedChain(chainId)))
         .map((chainId) => ({ type: 'native' as const, chainId }))
-      if (natives.length > 0) applySelection({
-        targets: natives,
-        natives: natives.length,
-        tokens: 0,
-        custom: 0,
-        customSymbols: [],
-        capped: false,
-        skipped: 0
-      })
+      if (natives.length > 0)
+        applySelection({
+          targets: natives,
+          natives: natives.length,
+          tokens: 0,
+          custom: 0,
+          customSymbols: [],
+          capped: false,
+          skipped: 0
+        })
     }
 
     const tokenTargets = targets.filter(
@@ -955,7 +1012,9 @@ export function createCmcPriceFeed(
       symbols: symbols.length,
       symbolList: symbols,
       custom: customTargets.length,
-      customSymbols: customTargets.map((token) => token.symbol).filter((symbol): symbol is string => Boolean(symbol)),
+      customSymbols: customTargets
+        .map((token) => token.symbol)
+        .filter((symbol): symbol is string => Boolean(symbol)),
       hotTokenSymbols: plan.hotTokenSymbols,
       retryTokenSymbols: plan.retryTokenSymbols,
       dead: Object.keys(cacheState.dead).length
@@ -967,6 +1026,11 @@ export function createCmcPriceFeed(
         emptyRetries: emptyTargetRetries
       })
       return 'empty'
+    }
+
+    if (isPaused()) {
+      log.info('CMC poll skipped, app hidden or system idle')
+      return 'paused'
     }
 
     const polledFingerprint = currentFingerprint
@@ -994,7 +1058,13 @@ export function createCmcPriceFeed(
     const rethrowFatal = (e: unknown) => {
       const status = e instanceof CmcHttpError ? e.status : undefined
       const errorCode = e instanceof CmcHttpError ? e.errorCode : undefined
-      if (status === 401 || status === 403 || status === 429 || asNumber(errorCode) === 1006 || asNumber(errorCode) === 1008) {
+      if (
+        status === 401 ||
+        status === 403 ||
+        status === 429 ||
+        asNumber(errorCode) === 1006 ||
+        asNumber(errorCode) === 1008
+      ) {
         throw e
       }
       return { status, errorCode }
@@ -1016,7 +1086,9 @@ export function createCmcPriceFeed(
           requested: batch.length,
           symbols: batch,
           quoted: quotes.length,
-          quotedSymbols: quotes.map((quote) => quote.symbol).filter((symbol): symbol is string => Boolean(symbol)),
+          quotedSymbols: quotes
+            .map((quote) => quote.symbol)
+            .filter((symbol): symbol is string => Boolean(symbol)),
           applied: batchApplied,
           credit_count: status.credit_count,
           error_code: status.error_code || 0
@@ -1040,7 +1112,10 @@ export function createCmcPriceFeed(
 
     // One tick: natives + hot custom/held in parallel. Due dead symbols add at most
     // one extra concurrent quotes/latest (never one HTTP call per failed token).
-    const quoteJobs = [quoteBySymbol(plan.nativeSymbols, 'native'), quoteBySymbol(plan.hotTokenSymbols, 'hot')]
+    const quoteJobs = [
+      quoteBySymbol(plan.nativeSymbols, 'native'),
+      quoteBySymbol(plan.hotTokenSymbols, 'hot')
+    ]
     if (plan.retryTokenSymbols.length > 0) {
       quoteJobs.push(quoteBySymbol(plan.retryTokenSymbols, 'retry'))
     }
@@ -1052,7 +1127,11 @@ export function createCmcPriceFeed(
       (target) => target.type === 'native' && !pricedKeys.has(targetKey(target))
     )
     const missingNativeIds = Array.from(
-      new Set(missingNatives.map((target) => getNativeCmcId(target.chainId)).filter((id): id is number => Boolean(id)))
+      new Set(
+        missingNatives
+          .map((target) => getNativeCmcId(target.chainId))
+          .filter((id): id is number => Boolean(id))
+      )
     )
 
     if (missingNativeIds.length > 0) {
@@ -1103,7 +1182,9 @@ export function createCmcPriceFeed(
           credits += status.credit_count || 0
           const quotes = normalizeQuoteAssets(data)
           quoted += quotes.length
-          const byId = new Map(quotes.filter((quote) => quote.id !== undefined).map((quote) => [quote.id, quote]))
+          const byId = new Map(
+            quotes.filter((quote) => quote.id !== undefined).map((quote) => [quote.id, quote])
+          )
           const updates: RateUpdate[] = []
 
           for (const token of leftoverTokens) {
@@ -1163,6 +1244,8 @@ export function createCmcPriceFeed(
   }
 
   async function tick() {
+    if (isPaused()) return
+
     if (inflight) {
       schedule(5_000)
       return
@@ -1171,6 +1254,7 @@ export function createCmcPriceFeed(
     inflight = true
     try {
       const result = await poll()
+      if (isPaused() || result === 'paused') return
       if (result === 'empty' && targets.length > 0) {
         emptyTargetRetries = 0
         schedule(FIRST_POLL_DELAY_MS)
@@ -1233,17 +1317,20 @@ export function createCmcPriceFeed(
 
     if (!changed) return
 
+    if (isPaused()) return
+
     const now = Date.now()
     const backoffIn = Math.max(0, backoffUntil - now)
 
     // A poll is already quoting a stale snapshot. Mark catch-up and do not
-    // reschedule here — scheduleAfterPoll would overwrite a 1s retry with 5 min.
+    // reschedule here — scheduleAfterPoll would overwrite a 1s retry with the
+    // active interval.
     if (inflight) {
       pendingCatchUp = true
       return
     }
 
-    // Cold start / first priced targets: do not wait MIN_POLL_GAP or the 5 min interval.
+    // Cold start / first priced targets: do not wait MIN_POLL_GAP or the active interval.
     if (!completedTargetPoll) {
       emptyTargetRetries = 0
       schedule(Math.max(backoffIn, FIRST_POLL_DELAY_MS))
@@ -1251,7 +1338,7 @@ export function createCmcPriceFeed(
     }
 
     pendingCatchUp = true
-    schedule(Math.max(backoffIn, EMPTY_TARGET_RETRY_MS))
+    schedule(Math.max(backoffIn, catchUpDelay()))
   }
 
   function start() {
@@ -1281,18 +1368,23 @@ export function createCmcPriceFeed(
       pollIntervalMs: pollInterval(),
       maxTokens: getCmcMaxTokens()
     })
-    schedule(FIRST_POLL_DELAY_MS)
+    unsubscribeActivity?.()
+    unsubscribeActivity = activity.subscribe(handleActivity)
+    if (!isPaused() && !pollTimer) {
+      schedule(FIRST_POLL_DELAY_MS)
+    }
   }
 
   function stop() {
     started = false
+    unsubscribeActivity?.()
+    unsubscribeActivity = undefined
     clearTimer()
     targets = []
     subscribedChains = []
     subscribedAddress = undefined
     currentFingerprint = ''
     emptyTargetRetries = 0
-    catchUpRetries = 0
     completedTargetPoll = false
     pendingCatchUp = false
     lastPolledFingerprint = ''
